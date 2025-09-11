@@ -1,2 +1,11 @@
-# Auto detect text files and perform LF normalization
+# Все текстовые файлы в репозитории будут использовать символы конца строки LF
 * text=auto
+
+# Принудительно устанавливаем LF для файлов с кодом
+*.py text eol=lf
+*.json text eol=lf
+
+# Указываем, что эти файлы являются бинарными, чтобы Git не менял их
+*.svg binary
+*.png binary
+*.jpg binary
