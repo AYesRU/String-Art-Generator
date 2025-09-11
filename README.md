@@ -34,18 +34,8 @@
 python main.py <путь_к_изображению>
 ```
 
-**Пример:**
-
-```bash
-python main.py images/example.jpg
-```
-
-  * `images/example.jpg` — это путь к исходному файлу.
-
-После запуска программа обработает изображение и сохранит результат в папке `output`.
-
 -----
 
 ### Автор
 
-  * **AYesRU** - [https://github.com/AYesRU](https://www.google.com/search?q=https://github.com/AYesRU)
+  * **Андрей Есенцев** - [https://github.com/AYesRU](https://www.google.com/search?q=https://github.com/AYesRU)
