@@ -4,8 +4,11 @@
 # Принудительно устанавливаем LF для файлов с кодом
 *.py text eol=lf
 *.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
 
 # Указываем, что эти файлы являются бинарными, чтобы Git не менял их
 *.svg binary
 *.png binary
 *.jpg binary
+*.jpeg binary
