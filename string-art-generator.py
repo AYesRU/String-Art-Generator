@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Генератор изображений в технике String Art с использованием гибридного алгоритма.
-Версия 8.6:
+Версия 8.7 (Улучшено на основе анализа)
 """
 
 # ----------------------------------------------------------------------
@@ -20,6 +20,9 @@ import io
 import random
 import logging
 import json
+import cProfile
+import pstats
+from collections import OrderedDict
 from typing import Dict, Any, List, Optional, Tuple, Callable
 
 # --- Библиотеки для работы с изображениями и построения графиков ---
@@ -65,8 +68,35 @@ except ImportError:
     NUMBA_AVAILABLE = False
 
 
-# --- Настройка логирования ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
+# --- Новая функция для определения пути ---
+def get_base_path():
+    """Возвращает базовый путь приложения (рядом с .exe или .py)"""
+    if getattr(sys, 'frozen', False):
+        # Если приложение "заморожено" (например, PyInstaller)
+        return os.path.dirname(sys.executable)
+    else:
+        # Если запускается как обычный скрипт
+        try:
+            # __file__ доступен, когда запускается как файл
+            return os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            # Fallback для интерактивных сред, где __file__ не определен
+            return os.path.abspath(".")
+
+# --- Настройка логирования (РЕКОМЕНДАЦИЯ 13) ---
+def setup_logging():
+    base_path = get_base_path()
+    log_dir = os.path.join(base_path, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"app_{time.strftime('%Y%m%d')}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
 
 # --- Глобальные константы ---
 IMAGE_SIZE = 400
@@ -93,11 +123,11 @@ TOOLTIPS = {
     'memetic_depth': "Количество итераций 'полировки' для каждой особи.\nРекомендуется: 20-40.",
     'radon_enabled': "ГИБРИД: Использовать преобразование Радона для направления поиска.\nУскоряет сходимость на глобальном уровне, находя важные структуры.",
     'radon_influence': "ГИБРИД: Сила влияния Радона (%).\nОпределяет, насколько сильно Радон смещает выбор линий.",
-    'start': "Начать процесс генерации.",
-    'pause': "Приостановить/возобновить генерацию.",
-    'stop': "Остановить генерацию и сохранить текущий лучший результат.",
+    'start': "Начать процесс генерации. (Пробел)",
+    'pause': "Приостановить/возобновить генерацию. (Пробел)",
+    'stop': "Остановить генерацию и сохранить текущий лучший результат. (Escape)",
     'export_txt': "Сохранить последовательность номеров гвоздей для ручной работы.",
-    'export_png': "Сохранить итоговую картинку в высоком разрешении (2000x2000px).",
+    'export_png': "Сохранить итоговую картинку в высоком разрешении (2000x2000px). (Ctrl+S)",
     'export_svg': "Сохранить результат в векторном формате SVG,\nидеальном для масштабирования и печати.",
 }
 
@@ -105,6 +135,25 @@ TOOLTIPS = {
 # ----------------------------------------------------------------------
 # РАЗДЕЛ 2: НИЗКОУРОВНЕВЫЕ УТИЛИТЫ
 # ----------------------------------------------------------------------
+
+# КРИТИЧЕСКОЕ УЛУЧШЕНИЕ 1: LRU кэш для предотвращения утечек памяти
+class LRUCache:
+    def __init__(self, maxsize=1000):
+        self.cache = OrderedDict()
+        self.maxsize = maxsize
+    
+    def get(self, key, default=None):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return default
+    
+    def set(self, key, value):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        if len(self.cache) > self.maxsize:
+            self.cache.popitem(last=False)
 
 def prepare_target_image(original_image: Optional[Image.Image], target_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if original_image is None:
@@ -224,8 +273,9 @@ class CanvasManager:
     def __init__(self, size: int, num_pins: int, shape: str = 'Круг'):
         self.size, self.num_pins, self.shape = size, num_pins, shape
         self.pin_coords = self._calculate_pin_coords()
-        self.pixel_cache: Dict[Tuple[int, int], np.ndarray] = {}
-        self.mask_cache: Dict[Tuple[Any, ...], np.ndarray] = {}
+        # КРИТИЧЕСКОЕ УЛУЧШЕНИЕ 1: Замена словарей на LRU кэш с ограничением
+        self.pixel_cache = LRUCache(maxsize=10000)
+        self.mask_cache = LRUCache(maxsize=5000)
         self.mask_cache_lock = threading.Lock()
 
     def _calculate_pin_coords(self) -> np.ndarray:
@@ -254,20 +304,24 @@ class CanvasManager:
 
     def get_line_pixel_indices(self, p1_idx: int, p2_idx: int) -> np.ndarray:
         key = tuple(sorted((p1_idx, p2_idx)))
-        if key in self.pixel_cache: return self.pixel_cache[key]
+        if (pixels := self.pixel_cache.get(key)) is not None:
+            return pixels
         pixels = _calculate_line_pixels_numpy(*self.pin_coords[p1_idx], *self.pin_coords[p2_idx], self.size)
-        self.pixel_cache[key] = pixels
+        self.pixel_cache.set(key, pixels)
         return pixels
 
     def get_line_mask_cpu(self, p1_idx: int, p2_idx: int, thickness: int) -> np.ndarray:
         key = (tuple(sorted((p1_idx, p2_idx))), self.size, thickness)
-        if key in self.mask_cache: return self.mask_cache[key]
+        if (mask := self.mask_cache.get(key)) is not None:
+            return mask
         with self.mask_cache_lock:
-            if key in self.mask_cache: return self.mask_cache[key]
+            # Повторная проверка внутри блокировки на случай, если другой поток уже создал маску
+            if (mask := self.mask_cache.get(key)) is not None:
+                return mask
             mask = np.zeros((self.size, self.size), dtype=np.float32)
             p1, p2 = tuple(self.pin_coords[p1_idx].astype(int)), tuple(self.pin_coords[p2_idx].astype(int))
             cv2.line(mask, p1, p2, 1.0, thickness, cv2.LINE_AA)
-            self.mask_cache[key] = mask
+            self.mask_cache.set(key, mask)
             return mask
 
     def render_chromosome_to_numpy(self, chromosome: List[int], thickness: int = 1) -> np.ndarray:
@@ -378,8 +432,13 @@ class FitnessCalculator:
             return [self.calculate_single_fitness(c) for c in chromosomes]
         try:
             return self._calculate_fitness_gpu(self._render_chromosome_batch_gpu(chromosomes))
+        # КРИТИЧЕСКОЕ УЛУЧШЕНИЕ 2: Улучшенный fallback на CPU при OOM GPU
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-            logging.warning(f"GPU error ({e}), falling back to CPU for fitness batch.")
+            logging.warning(f"GPU error ({e}), permanently falling back to CPU for this run.")
+            torch.cuda.empty_cache()
+            self.device = None  # Отключаем GPU для будущих вызовов
+            self.line_pixels_gpu_map = None # Очищаем карту
+            self.queues['status_queue'].put({'type': 'gpu_status', 'data': False})
             return [self.calculate_single_fitness(c) for c in chromosomes]
 
     def calculate_batch_fitness(self, population: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -468,6 +527,8 @@ class IslandThread(threading.Thread):
         self.mutation_operators = {"reverse": self._reverse, "swap": self._swap, "insert": self._insert,
                                    "scramble": self._scramble, "radon_guided_swap": self._radon_swap}
         self.mutation_stats = {name: {"success": 1, "attempts": 1} for name in self.mutation_operators.keys()}
+        # РЕКОМЕНДАЦИЯ 9: История фитнеса для адаптивной мутации
+        self.fitness_history = []
 
     def stop(self): self.stop_event.set()
     def pause(self): self.pause_event.clear()
@@ -579,16 +640,32 @@ class IslandThread(threading.Thread):
         
         return total_distance / num_comparisons if num_comparisons > 0 else 0.0
 
-    def _evolve_one_generation(self, stage, start, end, patience, limit):
-        self._send_generation_tick(stage, patience, limit)
-        self._process_migrant()
+    # РЕКОМЕНДАЦИЯ 9: Адаптивная мутация
+    def _calculate_adaptive_mutation_rate(self, base_rate, patience, limit):
+        """Умная адаптация мутации на основе истории"""
+        if self.best_on_island:
+            self.fitness_history.append(self.best_on_island['fitness'])
+        
+        if len(self.fitness_history) > 20:
+            recent = self.fitness_history[-20:]
+            improvement = recent[-1] - recent[0]
+            
+            if improvement < 1e-5: # Стагнация
+                return min(base_rate * 2.0, 0.9)
+            elif improvement > 0.01: # Быстрый прогресс
+                return max(base_rate * 0.5, 0.05)
 
         stagnation = 1.0 + (patience / limit) * STAGNATION_MUTATION_FACTOR
         diversity = self._calculate_population_diversity()
         diversity_factor = 1.0 + (0.5 - min(diversity, 0.5)) * 2.0
+        return min(base_rate * stagnation * diversity_factor, 0.9)
+
+    def _evolve_one_generation(self, stage, start, end, patience, limit):
+        self._send_generation_tick(stage, patience, limit)
+        self._process_migrant()
+
         base_mutation_rate = self.config['mutation_rate'] / 100.0
-        dynamic_rate = base_mutation_rate * stagnation * diversity_factor
-        mut_rate = min(dynamic_rate, 0.9)
+        mut_rate = self._calculate_adaptive_mutation_rate(base_mutation_rate, patience, limit)
         
         self.population = self._create_new_population(start, end, mut_rate)
         if self.config.get('memetic_enabled', False): self._apply_local_search(start, end)
@@ -620,7 +697,18 @@ class IslandThread(threading.Thread):
                 chromos_to_eval.append({'chromosome': child})
         
         if chromos_to_eval:
-            evaluated_pop = self.fitness_calculator.calculate_batch_fitness(chromos_to_eval)
+            # ИЗМЕНЕНИЕ: Разделяем оценку на части для отзывчивости к остановке
+            chunk_size = 16  # Оцениваем пакетами, чтобы не блокировать поток надолго
+            evaluated_pop = []
+            for i in range(0, len(chromos_to_eval), chunk_size):
+                if self.stop_event.is_set():
+                    logging.info(f"Island {self.island_id} stopping during population evaluation.")
+                    break  # Прерываем оценку, если получен сигнал остановки
+                
+                chunk = chromos_to_eval[i:i + chunk_size]
+                evaluated_chunk = self.fitness_calculator.calculate_batch_fitness(chunk)
+                evaluated_pop.extend(evaluated_chunk)
+
             new_pop_data.extend(evaluated_pop)
 
         for ind_data in new_pop_data:
@@ -751,8 +839,16 @@ class IslandManagerThread(threading.Thread):
                 time.sleep(0.1); gen_counter += 1
                 if gen_counter % self.config.get('migration_interval', 20) == 0: self._perform_migration()
             
+            # КРИТИЧЕСКОЕ УЛУЧШЕНИЕ 3: Улучшенная остановка потоков
             for island in self.islands:
-                island.join(timeout=1.0)
+                island.join(timeout=2.0)
+                if island.is_alive():
+                    logging.warning(f"Island {island.island_id} didn't stop gracefully, forcing stop event.")
+                    island.stop_event.set() # Принудительно выставляем флаг
+            
+            # Очистка ресурсов
+            if hasattr(self.fitness_calculator, 'device') and self.fitness_calculator.device:
+                torch.cuda.empty_cache()
                 
             msg = 'Процесс остановлен.' if self.stop_event.is_set() else 'Генерация завершена!'
             self.status_queue.put({'type': 'done', 'data': msg})
@@ -798,6 +894,28 @@ class AppState:
 
     def get_config(self) -> Dict[str, Any]: return {k: v.get() for k, v in self.vars.items()}
     
+    # РЕКОМЕНДАЦИЯ 4: Валидация конфигурации
+    def validate_config(self) -> Tuple[bool, str]:
+        config = self.get_config()
+        if config['radon_enabled'] and not SKIMAGE_AVAILABLE:
+            return False, "Для использования Радона необходима библиотека scikit-image."
+        
+        if GPU_ENABLED_FLAG and torch:
+            try:
+                props = torch.cuda.get_device_properties(0)
+                mem_free, _ = torch.cuda.mem_get_info(0)
+                # Очень грубая оценка. 4 байта на пиксель * 3-4 копии в памяти
+                estimated_usage = config['population_size'] * config['num_islands'] * IMAGE_SIZE * IMAGE_SIZE * 4 * 4
+                if estimated_usage > mem_free * 0.8:
+                    return False, f"Недостаточно GPU памяти (нужно ~{estimated_usage/1e9:.1f}GB). Уменьшите популяцию или число островов."
+            except Exception as e:
+                logging.warning(f"Could not check GPU memory: {e}")
+
+        if config['lines'] * config['pins'] > 20_000_000:
+            return False, "Слишком большое произведение кол-ва линий на кол-во гвоздей (>20M). Может привести к нестабильной работе."
+        
+        return True, ""
+
     def save_config(self, filepath: str) -> bool:
         try:
             with open(filepath, 'w', encoding='utf-8') as f:
@@ -860,6 +978,7 @@ class UIManager:
 
     def create_widgets(self):
         self.root.configure(bg=self.root.theme['bg_primary'])
+        self._create_menu()
         main_pane = ttk.PanedWindow(self.root, orient=tk.VERTICAL, style='Custom.Vertical.TPanedwindow')
         main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
         
@@ -872,6 +991,23 @@ class UIManager:
         progress_frame = ttk.LabelFrame(main_pane, text=" Прогресс Эволюции ", style='Modern.TLabelframe')
         main_pane.add(progress_frame, weight=1)
         self._create_stats_and_chart_area(progress_frame)
+
+    def _create_menu(self):
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Файл", menu=file_menu)
+        file_menu.add_command(label="Загрузить изображение...", command=self.root.load_image, accelerator="Ctrl+O")
+        file_menu.add_command(label="Экспорт PNG...", command=lambda: self.coordinator.export_png(), accelerator="Ctrl+S")
+        file_menu.add_separator()
+        file_menu.add_command(label="Выход", command=self.root.on_closing, accelerator="Ctrl+Q")
+        
+        # РЕКОМЕНДАЦИЯ 14: Меню для профилирования
+        debug_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Отладка", menu=debug_menu)
+        debug_menu.add_command(label="Начать профилирование", command=self.root.start_profiling)
+        debug_menu.add_command(label="Остановить профилирование", command=self.root.stop_profiling)
 
     def _create_control_panel(self, parent: ttk.PanedWindow):
         container = ttk.Frame(parent, width=400, style='Controls.TFrame')
@@ -937,10 +1073,10 @@ class UIManager:
             btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=3); ToolTip(btn, TOOLTIPS[n])
             self.widgets[f'{n}_button'] = btn
         
-        ttk.Separator(frame4, orient='horizontal').pack(fill='x', pady=15)
+        #ttk.Separator(frame4, orient='horizontal').pack(fill='x', pady=15) # Линия убрана
         
         export_frame = ttk.Frame(frame4, style='Controls.TFrame')
-        export_frame.pack(fill=tk.X, pady=3)
+        export_frame.pack(fill=tk.X, pady=(10, 3)) # Добавлен отступ сверху
         
         exp_btns = [('export_txt', ".txt", self.coordinator.export_txt),
                     ('export_png', ".png", self.coordinator.export_png),
@@ -975,7 +1111,12 @@ class UIManager:
         bottom = ttk.Frame(p, style='Controls.TFrame'); bottom.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5,10))
         
         left = ttk.Frame(bottom, style='Controls.TFrame'); left.pack(side=tk.LEFT, fill=tk.BOTH, padx=(0, 10))
+        
+        # РЕКОМЕНДАЦИЯ 5: Прогресс-бар для длительных операций
         self.widgets['status_label'] = ttk.Label(left, text="Ожидание...", style='Status.TLabel'); self.widgets['status_label'].pack(anchor='w')
+        self.widgets['status_progress'] = ttk.Progressbar(left, orient='horizontal', mode='indeterminate'); 
+        # self.widgets['status_progress'].pack(fill=tk.X, pady=2) # Unpacked by default
+        
         self.widgets['fitness_label'] = ttk.Label(left, text="", style='Secondary.TLabel'); self.widgets['fitness_label'].pack(anchor='w', pady=(0, 5))
         self.widgets['compute_mode_label'] = ttk.Label(left, text="Режим: --", font=self.root.small_font); self.widgets['compute_mode_label'].pack(anchor='w', pady=(0, 15))
         for k, t in [('time', "Время:"), ('eta', "ETA:"), ('gens', "Поколений:"), ('mig', "Миграций:"), ('len', "Длина нити:")]:
@@ -1049,7 +1190,19 @@ class UIManager:
         if not self.ax or not self.chart_canvas: return
         self.ax.clear()
         num_islands = self.state.get_config()['num_islands']
-        colors = plt.cm.hsv(np.linspace(0, 1, num_islands + 1))[:-1] if num_islands > 0 else []
+        if num_islands == 0:
+            # Просто очищаем, если островов нет
+            self.chart_canvas.draw()
+            return
+
+        # Генерируем n+1 цветов в полном цикле от красного до красного (0 до 1 в HSV)
+        # и берем первые n цветов для n островов.
+        # Это обеспечивает равномерное распределение по всему спектру.
+        if num_islands > 0:
+            colors = plt.cm.hsv(np.linspace(0, 1, num_islands + 1))[:-1]
+        else:
+            colors = []
+        
         for i in range(num_islands):
             if data := self.state.chart_data_by_island.get(i, []):
                 self.ax.plot(*zip(*data), label=f'Остров {i + 1}', color=colors[i])
@@ -1135,7 +1288,7 @@ class UIManager:
         canvas.delete("all"); canvas.create_image(w // 2, h // 2, image=photo)
 
     def update_title(self):
-        title = "String Art Generator v8.5"
+        title = "String Art Generator v8.7"
         if self.state.original_image_path: title += f" - [{os.path.basename(self.state.original_image_path)}]"
         self.root.title(title)
 
@@ -1156,7 +1309,12 @@ class EvolutionCoordinator:
         self.best_chromosomes_by_key: Dict[Any, List[int]] = {}
         self.stats_update_job: Optional[str] = None
         self.canvas_manager: Optional[CanvasManager] = None
+        # КРИТИЧЕСКОЕ УЛУЧШЕНИЕ 11: Блокировка для render_cache
         self.render_cache: Dict[Tuple, Image.Image] = {}
+        self.render_cache_lock = threading.Lock()
+        # РЕКОМЕНДАЦИЯ 6: Автосохранение
+        self.checkpoint_interval = 300  # 5 минут
+        self.last_checkpoint = 0
         self._start_renderer_thread()
 
     def _start_renderer_thread(self):
@@ -1170,28 +1328,29 @@ class EvolutionCoordinator:
                 if self.canvas_manager is None: continue
                 chromosome, _, thickness = data
                 img = self.canvas_manager.render_chromosome_to_pil(chromosome, thickness)
-                self.render_cache[(tuple(chromosome), self.canvas_manager.size, thickness)] = img
+                with self.render_cache_lock:
+                    self.render_cache[(tuple(chromosome), self.canvas_manager.size, thickness)] = img
                 self.render_results_queue.put((key, img))
             except Exception: logging.error("Error in renderer thread", exc_info=True)
 
     def start_generation(self):
         if self.state.original_image is None: return messagebox.showwarning("Внимание", "Загрузите изображение.")
-        config = self.state.get_config()
-        if not self._validate_config(config): return
-        self.state.reset_for_new_run(); self.ui_manager.toggle_ui_state(True)
-        self.best_chromosomes_by_key.clear(); self.render_cache.clear()
-        self.ui_manager.setup_for_new_run(config['num_islands'])
+        is_valid, msg = self.state.validate_config()
+        if not is_valid:
+            return messagebox.showerror("Ошибка конфигурации", msg)
+        
+        self.state.reset_for_new_run()
+        self.ui_manager.toggle_ui_state(True)
+        self.best_chromosomes_by_key.clear()
+        with self.render_cache_lock:
+            self.render_cache.clear()
+        self.ui_manager.setup_for_new_run(self.state.get_config()['num_islands'])
         threading.Thread(target=self._prepare_and_run_evolution, name="PreparationThread", daemon=True).start()
-
-    def _validate_config(self, config):
-        if config['pins'] < 3: return messagebox.showerror("Ошибка", "Нужно минимум 3 гвоздя.") or False
-        if config['lines'] < 10: return messagebox.showerror("Ошибка", "Нужно минимум 10 линий.") or False
-        if config.get('radon_enabled') and not SKIMAGE_AVAILABLE:
-            return messagebox.showerror("Ошибка", "scikit-image не найден. Помощь Радона недоступна.") or False
-        return True
 
     def _prepare_and_run_evolution(self):
         try:
+            # РЕКОМЕНДАЦИЯ 5: Неопределенный прогресс
+            self.queues['status_queue'].put({'type': 'progress_indeterminate', 'data': True})
             config = self.state.get_config()
             self._send_status("Подготовка изображения...")
             target_np, edges_np, saliency = prepare_target_image(self.state.original_image, IMAGE_SIZE)
@@ -1205,10 +1364,12 @@ class EvolutionCoordinator:
             self.queues['status_queue'].put({'type': 'fit_func_maps', 'data': {'saliency': saliency, 'dt': fc.distance_transform_map}})
             if fc.device: self._prepare_gpu_data(fc)
             self._start_island_manager(config, fc, target_np, radon_guide)
-        except Exception:
+        except Exception as e:
             logging.error("Preparation thread error", exc_info=True)
-            self.queues['status_queue'].put({'type': 'error', 'data': "Критическая ошибка при подготовке."})
+            self.queues['status_queue'].put({'type': 'error', 'data': f"Критическая ошибка при подготовке:\n{e}"})
             self.ui_manager.toggle_ui_state(False)
+        finally:
+            self.queues['status_queue'].put({'type': 'progress_indeterminate', 'data': False})
 
     def _prepare_gpu_data(self, fc): self._send_status("Кэширование линий для GPU..."); fc.enable_gpu_rendering(fc.canvas_manager.precompute_line_data_for_gpu(fc.device))
     
@@ -1257,8 +1418,18 @@ class EvolutionCoordinator:
                  'gpu_status': self._handle_gpu_status, 'generation_tick': self._handle_generation_tick,
                  'island_update': self._handle_island_update, 'done': self._handle_done, 'migration': self._handle_migration,
                  'fit_func_maps': self._handle_fit_func_maps, 'radon_map': self._handle_radon_map,
+                 'progress_indeterminate': self._handle_progress_indeterminate,
                }.get(msg_type, lambda data: None)
     
+    def _handle_progress_indeterminate(self, show: bool):
+        pb = self.ui_manager.widgets['status_progress']
+        if show:
+            pb.pack(fill=tk.X, pady=2, before=self.ui_manager.widgets['fitness_label'])
+            pb.start()
+        else:
+            pb.stop()
+            pb.pack_forget()
+
     def _handle_greedy_update_island(self, data: Dict[str, Any]):
         island_id, path, text = data['id'], data['path'], data['text']
         self.ui_manager.widgets['status_label'].config(text=f"Остров {island_id+1}: {text}")
@@ -1301,6 +1472,32 @@ class EvolutionCoordinator:
                 _, diff_map = fc.calculate_single_fitness_and_map(c)
                 if diff_map is not None:
                     self.render_results_queue.put(('diff_map', self._create_diff_pil_image(diff_map)))
+        
+        # РЕКОМЕНДАЦИЯ 6: Проверка для автосохранения
+        if time.time() - self.last_checkpoint > self.checkpoint_interval:
+            self._save_checkpoint()
+            self.last_checkpoint = time.time()
+    
+    def _save_checkpoint(self):
+        if not self.state.overall_best_chromosome: return
+        try:
+            base_path = get_base_path()
+            checkpoint_dir = os.path.join(base_path, "checkpoints")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filepath = os.path.join(checkpoint_dir, f"checkpoint_{timestamp}.json")
+            data = {
+                'chromosome': self.state.overall_best_chromosome,
+                'fitness': self.state.overall_best_fitness,
+                'config': self.state.get_config(),
+                'generation': sum(self.state.generation_counters.values()),
+                'image_path': self.state.original_image_path
+            }
+            with open(filepath, 'w') as f: json.dump(data, f)
+            logging.info(f"Checkpoint saved: {filepath}")
+        except Exception as e:
+            logging.error(f"Failed to save checkpoint: {e}")
+
     def _handle_fit_func_maps(self, data):
         if 'saliency' in data and data['saliency'] is not None: self.render_results_queue.put(('fit_saliency', Image.fromarray(data['saliency']).convert('L')))
         if 'dt' in data and data['dt'] is not None: self.render_results_queue.put(('fit_dt', Image.fromarray((data['dt'] * 255).astype(np.uint8)).convert('L')))
@@ -1319,7 +1516,10 @@ class EvolutionCoordinator:
     def request_canvas_update(self, key, data, params={}):
         if not (self.canvas_manager and self.ui_manager.result_canvases.get(key)): return
         cache_key = (tuple(data[0]), self.canvas_manager.size, data[2])
-        if img := self.render_cache.get(cache_key): self.render_results_queue.put((key, img)); return
+        with self.render_cache_lock:
+            if img := self.render_cache.get(cache_key):
+                self.render_results_queue.put((key, img))
+                return
         self.render_queue.put((key, data, params))
 
     def _create_diff_pil_image(self, diff_map):
@@ -1361,9 +1561,27 @@ class EvolutionCoordinator:
             self.ui_manager.update_thread_length_display(self._calculate_thread_length(pruned))
         return removed
 
+    def _get_export_path(self, extension: str, filetype_desc: str) -> Optional[str]:
+        """Открывает диалог сохранения файла в папке 'exports'."""
+        base_path = get_base_path()
+        export_dir = os.path.join(base_path, "exports")
+        os.makedirs(export_dir, exist_ok=True)
+        
+        initial_filename = "string_art_result"
+        if self.state.original_image_path:
+            initial_filename = os.path.splitext(os.path.basename(self.state.original_image_path))[0]
+        
+        filepath = filedialog.asksaveasfilename(
+            initialdir=export_dir,
+            initialfile=f"{initial_filename}.{extension}",
+            defaultextension=f".{extension}",
+            filetypes=[(filetype_desc, f"*.{extension}")]
+        )
+        return filepath if filepath else None
+
     def export_txt(self):
         if not self.state.overall_best_chromosome: return
-        if not (filepath := filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files", "*.txt")])): return
+        if not (filepath := self._get_export_path("txt", "Text files")): return
         length = self._calculate_thread_length(self.state.overall_best_chromosome)
         info = f"Примерная длина нити для холста 10 см: {length:.2f} м\n"
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -1376,7 +1594,7 @@ class EvolutionCoordinator:
 
     def export_png(self):
         if not self.state.overall_best_chromosome: return
-        if not (filepath := filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG images", "*.png")])): return
+        if not (filepath := self._get_export_path("png", "PNG images")): return
         self._send_status("Экспорт PNG (2000px)...")
         config = self.state.get_config()
         cm = CanvasManager(2000, config['pins'], config['canvas_shape'])
@@ -1386,7 +1604,7 @@ class EvolutionCoordinator:
 
     def export_svg(self):
         if not self.state.overall_best_chromosome: return
-        if not (filepath := filedialog.asksaveasfilename(defaultextension=".svg", filetypes=[("SVG", "*.svg")])): return
+        if not (filepath := self._get_export_path("svg", "SVG files")): return
         self._send_status("Экспорт SVG...")
         config, size = self.state.get_config(), 1000
         cm = CanvasManager(size, config['pins'], config['canvas_shape'])
@@ -1434,6 +1652,9 @@ class StringArtApp(tk.Tk):
         self.ui_manager.create_widgets()
         self._load_last_config()
         self.ui_manager.update_title()
+        self._setup_hotkeys() # РЕКОМЕНДАЦИЯ 8
+
+        self.profiler = None # РЕКОМЕНДАЦИЯ 14
 
         self.after(100, self.coordinator.process_queues)
         self.after(1000, self._periodic_ui_update)
@@ -1464,7 +1685,7 @@ class StringArtApp(tk.Tk):
         style.configure('Custom.Horizontal.TPanedwindow', background=self.theme['bg_primary'])
 
         # --- Buttons ---
-        style.configure('TButton', font=self.bold_font, padding=(10, 8), relief='flat', background='#B0BEC5', foreground=self.theme['text_primary'])
+        style.configure('TButton', font=self.bold_font, padding=(10, 5), relief='flat', background='#B0BEC5', foreground=self.theme['text_primary']) # Высота уменьшена
         style.map('TButton', background=[('active', '#90A4AE')])
         style.configure('Accent.TButton', background=self.theme['accent'], foreground=self.theme['accent_fg'])
         style.map('Accent.TButton', background=[('active', '#005A9E')])
@@ -1480,12 +1701,50 @@ class StringArtApp(tk.Tk):
         style.configure('Modern.TNotebook', background=self.theme['bg_primary'], bordercolor=self.theme['border'])
         style.configure('Modern.TNotebook.Tab', padding=(10, 5), font=self.base_font, background=self.theme['bg_primary'], foreground=self.theme['text_secondary'])
         style.map('Modern.TNotebook.Tab', background=[('selected', self.theme['bg_secondary'])], foreground=[('selected', self.theme['accent'])])
+    
+    # РЕКОМЕНДАЦИЯ 8: Горячие клавиши
+    def _setup_hotkeys(self):
+        self.bind('<Control-o>', lambda e: self.load_image())
+        self.bind('<Control-s>', lambda e: self.coordinator.export_png() if not self.state.is_running else None)
+        self.bind('<Control-q>', lambda e: self.on_closing())
+        self.bind('<space>', lambda e: self.coordinator.toggle_pause() if self.state.is_running else self.coordinator.start_generation())
+        # ...
+    
+    # РЕКОМЕНДАЦИЯ 14: Функции профилирования
+    def start_profiling(self):
+        self.profiler = cProfile.Profile()
+        self.profiler.enable()
+        logging.info("Profiling started")
+        messagebox.showinfo("Профилирование", "Сбор данных о производительности начат.")
+
+    def stop_profiling(self):
+        if self.profiler:
+            self.profiler.disable()
+            logging.info("Profiling stopped")
+            
+            # Сохранение и вывод статистики
+            s = io.StringIO()
+            stats = pstats.Stats(self.profiler, stream=s).sort_stats('cumulative')
+            stats.print_stats(30) # Выводим 30 самых "тяжелых" функций
+            
+            base_path = get_base_path()
+            profile_dir = os.path.join(base_path, "profiles")
+            os.makedirs(profile_dir, exist_ok=True)
+            profile_file = os.path.join(profile_dir, f"profile_{time.strftime('%Y%m%d_%H%M%S')}.txt")
+            
+            with open(profile_file, 'w') as f:
+                f.write(s.getvalue())
+            
+            messagebox.showinfo("Профилирование", f"Сбор данных завершен. Результаты сохранены в:\n{profile_file}")
+            self.profiler = None
+        else:
+            messagebox.showwarning("Профилирование", "Профилирование не было запущено.")
 
     def _get_config_path(self) -> str:
-        home = os.path.expanduser("~")
-        config_dir = os.path.join(home, ".string-art-generator")
-        os.makedirs(config_dir, exist_ok=True)
-        return os.path.join(config_dir, "last_config.json")
+        base_path = get_base_path()
+        # Конфиг будет лежать прямо рядом с программой
+        os.makedirs(base_path, exist_ok=True)
+        return os.path.join(base_path, "last_config.json")
         
     def _load_last_config(self):
         config_path = self._get_config_path()
@@ -1495,7 +1754,7 @@ class StringArtApp(tk.Tk):
     def on_closing(self):
         config_path = self._get_config_path()
         self.state.save_config(config_path)
-        if self.state.is_running and messagebox.askokcancel("Выход", "Процесс активен. Выйти?"):
+        if self.state.is_running and messagebox.askokcancel("Выход", "Процесс генерации активен. Прервать и выйти?"):
             self.coordinator.stop_generation(); self.destroy()
         elif not self.state.is_running: self.destroy()
 
@@ -1507,25 +1766,38 @@ class StringArtApp(tk.Tk):
         try:
             if self.coordinator and self.coordinator.manager_thread:
                 is_alive = self.coordinator.manager_thread.is_alive()
-                if is_alive != self.state.is_running and not self.coordinator.stop_event.is_set():
-                    logging.warning(f"UI state mismatch detected (is_running={self.state.is_running}, is_alive={is_alive}). Correcting.")
-                    if self.coordinator.stats_update_job and not is_alive:
-                        self.after_cancel(self.coordinator.stats_update_job); self.coordinator.stats_update_job = None
-                    self.ui_manager.toggle_ui_state(is_alive)
+                if is_alive != self.state.is_running and not self.state.is_paused:
+                    # Проверяем, был ли поток остановлен принудительно или завершился сам
+                    if hasattr(self.coordinator.manager_thread, 'stop_event') and self.coordinator.manager_thread.stop_event.is_set():
+                        pass # Остановка инициирована пользователем
+                    else:
+                        logging.warning(f"UI state mismatch detected (is_running={self.state.is_running}, is_alive={is_alive}). Correcting.")
+                        if self.coordinator.stats_update_job and not is_alive:
+                            self.after_cancel(self.coordinator.stats_update_job); self.coordinator.stats_update_job = None
+                        self.ui_manager.toggle_ui_state(is_alive)
         except Exception as e: logging.error(f"Error in state check: {e}")
         finally: self.after(500, self._periodic_state_check)
 
     def load_image(self):
         if not (file_path := filedialog.askopenfilename(filetypes=[("Image files", "*.jpg *.jpeg *.png")])): return
         try:
-            self.state.original_image = Image.open(file_path)
+            img = Image.open(file_path)
+            
+            # РЕКОМЕНДАЦИЯ 12: Проверка размера и формата
+            if img.width < 100 or img.height < 100:
+                raise ValueError("Изображение слишком маленькое (минимум 100x100 пикселей)")
+            if img.mode not in ['RGB', 'RGBA', 'L']:
+                logging.warning(f"Image mode {img.mode} not directly supported, converting to RGB.")
+                img = img.convert('RGB')
+
+            self.state.original_image = img
             self.state.original_image_path = file_path
             self.ui_manager.update_title(); self.redraw_target_canvas()
             self.ui_manager.widgets['status_label'].config(text="Изображение загружено.")
             self.ui_manager.clear_analysis_tabs()
-        except Exception:
-            logging.error("Failed to load image.", exc_info=True)
-            messagebox.showerror("Ошибка", "Не удалось загрузить изображение.")
+        except Exception as e:
+            logging.error(f"Failed to load image: {e}", exc_info=True)
+            messagebox.showerror("Ошибка загрузки", f"Не удалось загрузить изображение:\n{str(e)}")
 
     def redraw_target_canvas(self, event=None):
         if not self.state.original_image: return
@@ -1541,6 +1813,7 @@ class StringArtApp(tk.Tk):
 
 
 if __name__ == "__main__":
+    setup_logging() # Инициализация логирования
     try:
         if getattr(sys, 'frozen', False):
             os.environ["OPENCV_SALIENCY_PATH"] = os.path.join(sys._MEIPASS, 'opencv-saliency')
@@ -1549,5 +1822,10 @@ if __name__ == "__main__":
     except Exception:
         logging.critical("Fatal error on startup", exc_info=True)
         root = tk.Tk(); root.withdraw()
-        messagebox.showerror("Критическая ошибка", f"Не удалось запустить приложение.\n\n{traceback.format_exc()}")
+        messagebox.showerror("Критическая ошибка", f"Не удалось запустить приложение.\n\nПодробности в лог-файле.\n\n{traceback.format_exc()}")
+
+
+
+
+
 
