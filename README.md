@@ -116,7 +116,6 @@ pip install pyinstaller
 pyinstaller --noconfirm --onedir --windowed --icon=StringArt.ico --name "StringArtStudioPro" string-art-generator.py
 ```
 Собранное приложение появится в папке `dist/StringArtStudioPro/`.
-Также в репозитории настроен автоматический **GitHub Actions Workflow** (`.github/workflows/build-exe.yml`).
 
 ---
 
