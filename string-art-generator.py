@@ -764,6 +764,11 @@ class AudioAssistant:
     def _worker_loop(self):
         speaker = None
         try:
+            try:
+                import pythoncom
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
             speaker = win32com.client.Dispatch("SAPI.SpVoice")
             speaker.Rate = 1
         except Exception as e:
@@ -1581,13 +1586,13 @@ class StringArtStudioApp(tk.Tk):
         self.notebook.add(self.tab_radon, text="🌀 Преобразование Радона")
         self.fig_radon = Figure(figsize=(7, 5), facecolor="#12131a")
         self.canvas_radon = FigureCanvasTkAgg(self.fig_radon, master=self.tab_radon)
-        self.canvas_radon.get_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas_radon.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         self.tab_stats = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_stats, text="📈 Сходимость")
         self.fig_stats = Figure(figsize=(7, 5), facecolor="#12131a")
         self.canvas_stats = FigureCanvasTkAgg(self.fig_stats, master=self.tab_stats)
-        self.canvas_stats.get_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas_stats.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def _init_split_view(self):
         ctrl_bar = ttk.Frame(self.tab_split)
