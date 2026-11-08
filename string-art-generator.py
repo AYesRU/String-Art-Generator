@@ -1294,7 +1294,7 @@ class ToolTip:
         tw.wm_overrideredirect(True)
         tw.wm_geometry(f"+{x}+{y}")
         label = tk.Label(tw, text=self.text, justify='left',
-                         background="#252736", foreground="#e2e4f0", relief='solid', borderwidth=1,
+                         background="#ffffff", foreground="#1f2328", bordercolor="#d0d7de", relief='solid', borderwidth=1,
                          font=("Segoe UI", 9))
         label.pack(ipadx=6, ipady=4)
 
@@ -1381,29 +1381,43 @@ class StringArtStudioApp(tk.Tk):
         style = ttk.Style(self)
         style.theme_use('clam')
 
-        self.configure(bg="#12131a")
-        style.configure(".", background="#12131a", foreground="#e2e4f0", font=("Segoe UI", 10))
-        style.configure("TFrame", background="#12131a")
-        style.configure("Sidebar.TFrame", background="#1a1c26")
-        style.configure("Card.TFrame", background="#1f2230", relief="solid", borderwidth=1)
-        style.configure("TLabel", background="#12131a", foreground="#e2e4f0")
-        style.configure("Header.TLabel", font=("Segoe UI", 11, "bold"), foreground="#4fa3ff", background="#1a1c26")
-        style.configure("SubHeader.TLabel", font=("Segoe UI", 9), foreground="#8e93aa", background="#1a1c26")
-        style.configure("Meta.TLabel", font=("Segoe UI", 9), foreground="#00ffd5", background="#1a1c26")
+        BG_MAIN = "#f6f8fa"
+        BG_SIDE = "#ffffff"
+        BG_CARD = "#ffffff"
+        TEXT_MAIN = "#1f2328"
+        TEXT_SUB = "#656d76"
+        ACCENT = "#0969da"
+        BORDER = "#d0d7de"
 
-        style.configure("TButton", background="#2a2d3d", foreground="#ffffff", borderwidth=1, relief="flat", padding=6)
-        style.map("TButton", background=[("active", "#4fa3ff"), ("pressed", "#2570d4")], foreground=[("active", "#000000")])
-        style.configure("Accent.TButton", background="#4fa3ff", foreground="#000000", font=("Segoe UI", 10, "bold"))
-        style.map("Accent.TButton", background=[("active", "#70b5ff"), ("pressed", "#3b8ced")])
-        style.configure("Stop.TButton", background="#ff3366", foreground="#ffffff", font=("Segoe UI", 10, "bold"))
-        style.map("Stop.TButton", background=[("active", "#ff5c85")])
+        self.configure(bg=BG_MAIN)
+        style.configure(".", background=BG_MAIN, foreground=TEXT_MAIN, font=("Segoe UI", 10))
+        style.configure("TFrame", background=BG_MAIN)
+        style.configure("Sidebar.TFrame", background=BG_SIDE)
+        style.configure("Card.TFrame", background=BG_CARD, relief="solid", borderwidth=1)
+        style.configure("TLabel", background=BG_MAIN, foreground=TEXT_MAIN)
+        style.configure("Header.TLabel", font=("Segoe UI", 11, "bold"), foreground=ACCENT, background=BG_SIDE)
+        style.configure("SubHeader.TLabel", font=("Segoe UI", 9), foreground=TEXT_SUB, background=BG_SIDE)
+        style.configure("Meta.TLabel", font=("Segoe UI", 9, "bold"), foreground=ACCENT, background=BG_SIDE)
 
-        style.configure("TNotebook", background="#12131a", tabmargins=[4, 4, 4, 0])
-        style.configure("TNotebook.Tab", background="#1e202c", foreground="#b0b4c8", padding=[12, 6], font=("Segoe UI", 10))
-        style.map("TNotebook.Tab", background=[("selected", "#2c3044")], foreground=[("selected", "#00ffd5")])
+        style.configure("TLabelframe", background=BG_SIDE)
+        style.configure("TLabelframe.Label", background=BG_SIDE, foreground=TEXT_MAIN, font=("Segoe UI", 9, "bold"))
 
-        style.configure("Horizontal.TProgressbar", background="#00ffd5", troughcolor="#1a1c26", borderwidth=0)
+        style.configure("TButton", background="#f6f8fa", foreground=TEXT_MAIN, borderwidth=1, relief="solid", padding=6)
+        style.map("TButton", background=[("active", "#eaeef2"), ("pressed", "#d0d7de")], foreground=[("active", ACCENT)])
+        style.configure("Accent.TButton", background=ACCENT, foreground="#ffffff", font=("Segoe UI", 10, "bold"), borderwidth=0)
+        style.map("Accent.TButton", background=[("active", "#0550ae"), ("pressed", "#043d84")], foreground=[("active", "#ffffff")])
+        style.configure("Stop.TButton", background="#cf222e", foreground="#ffffff", font=("Segoe UI", 10, "bold"), borderwidth=0)
+        style.map("Stop.TButton", background=[("active", "#a40e26")], foreground=[("active", "#ffffff")])
 
+        style.configure("TCombobox", background="#ffffff", fieldbackground="#ffffff", foreground=TEXT_MAIN)
+        style.configure("TScale", background=BG_SIDE, troughcolor="#e1e4e8")
+        style.configure("TCheckbutton", background=BG_SIDE, foreground=TEXT_MAIN)
+
+        style.configure("TNotebook", background=BG_MAIN, tabmargins=[4, 4, 4, 0])
+        style.configure("TNotebook.Tab", background="#e1e4e8", foreground=TEXT_SUB, padding=[14, 7], font=("Segoe UI", 10))
+        style.map("TNotebook.Tab", background=[("selected", "#ffffff")], foreground=[("selected", ACCENT)])
+
+        style.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor="#e1e4e8", borderwidth=0)
     def _create_layout(self):
         self.main_container = ttk.Frame(self)
         self.main_container.pack(fill=tk.BOTH, expand=True)
@@ -1417,7 +1431,7 @@ class StringArtStudioApp(tk.Tk):
         sidebar_outer.pack(side=tk.LEFT, fill=tk.Y, padx=0, pady=0)
         sidebar_outer.pack_propagate(False)
 
-        canvas = tk.Canvas(sidebar_outer, bg="#1a1c26", highlightthickness=0)
+        canvas = tk.Canvas(sidebar_outer, bg="#ffffff", highlightthickness=0)
         scrollbar = ttk.Scrollbar(sidebar_outer, orient="vertical", command=canvas.yview)
         self.sidebar_content = ttk.Frame(canvas, style="Sidebar.TFrame")
 
@@ -1432,7 +1446,7 @@ class StringArtStudioApp(tk.Tk):
 
         logo_frame = ttk.Frame(self.sidebar_content, style="Sidebar.TFrame")
         logo_frame.pack(fill=tk.X, **pad)
-        ttk.Label(logo_frame, text="STRING ART STUDIO", font=("Segoe UI", 14, "bold"), foreground="#4fa3ff", background="#1a1c26").pack(anchor="w")
+        ttk.Label(logo_frame, text="STRING ART STUDIO", font=("Segoe UI", 14, "bold"), foreground="#0969da", background="#ffffff").pack(anchor="w")
         ttk.Label(logo_frame, text=f"Движок v9.0 Pro | GPU: {CUDA_DEVICE_NAME}", style="SubHeader.TLabel").pack(anchor="w")
 
         load_btn = ttk.Button(self.sidebar_content, text="📁 Загрузить изображение...", style="Accent.TButton", command=self.load_image)
@@ -1564,7 +1578,7 @@ class StringArtStudioApp(tk.Tk):
 
         self.tab_result = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_result, text="🎨 Результат")
-        self.canvas_result = tk.Canvas(self.tab_result, bg="#12131a", highlightthickness=0)
+        self.canvas_result = tk.Canvas(self.tab_result, bg="#ffffff", highlightthickness=0)
         self.canvas_result.pack(fill=tk.BOTH, expand=True)
         self.canvas_result.bind("<Configure>", lambda e: self.request_rerender())
 
@@ -1574,23 +1588,23 @@ class StringArtStudioApp(tk.Tk):
 
         self.tab_diff = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_diff, text="🌡 Карта ошибок")
-        self.canvas_diff = tk.Canvas(self.tab_diff, bg="#12131a", highlightthickness=0)
+        self.canvas_diff = tk.Canvas(self.tab_diff, bg="#ffffff", highlightthickness=0)
         self.canvas_diff.pack(fill=tk.BOTH, expand=True)
 
         self.tab_density = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_density, text="📊 Плотность нитей")
-        self.canvas_density = tk.Canvas(self.tab_density, bg="#12131a", highlightthickness=0)
+        self.canvas_density = tk.Canvas(self.tab_density, bg="#ffffff", highlightthickness=0)
         self.canvas_density.pack(fill=tk.BOTH, expand=True)
 
         self.tab_radon = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_radon, text="🌀 Преобразование Радона")
-        self.fig_radon = Figure(figsize=(7, 5), facecolor="#12131a")
+        self.fig_radon = Figure(figsize=(7, 5), facecolor="#ffffff")
         self.canvas_radon = FigureCanvasTkAgg(self.fig_radon, master=self.tab_radon)
         self.canvas_radon.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         self.tab_stats = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_stats, text="📈 Сходимость")
-        self.fig_stats = Figure(figsize=(7, 5), facecolor="#12131a")
+        self.fig_stats = Figure(figsize=(7, 5), facecolor="#ffffff")
         self.canvas_stats = FigureCanvasTkAgg(self.fig_stats, master=self.tab_stats)
         self.canvas_stats.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
@@ -1602,14 +1616,14 @@ class StringArtStudioApp(tk.Tk):
                                 command=lambda e: self.update_split_display())
         scale_split.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=12)
 
-        self.canvas_split = tk.Canvas(self.tab_split, bg="#12131a", highlightthickness=0)
+        self.canvas_split = tk.Canvas(self.tab_split, bg="#ffffff", highlightthickness=0)
         self.canvas_split.pack(fill=tk.BOTH, expand=True)
 
     def _create_status_bar(self):
         status_bar = ttk.Frame(self, style="Sidebar.TFrame", height=32)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.lbl_status = ttk.Label(status_bar, text="Готов к работе. Загрузите изображение.", background="#1a1c26")
+        self.lbl_status = ttk.Label(status_bar, text="Готов к работе. Загрузите изображение.", background="#ffffff")
         self.lbl_status.pack(side=tk.LEFT, padx=12, pady=4)
 
         self.lbl_speed = ttk.Label(status_bar, text="Скорость: 0 нитей/сек", style="Meta.TLabel")
@@ -1728,7 +1742,7 @@ class StringArtStudioApp(tk.Tk):
             combined.paste(gen_resized.crop((split_x, 0, dim, dim)), (split_x, 0))
 
         draw = ImageDraw.Draw(combined)
-        draw.line([(split_x, 0), (split_x, dim)], fill="#00ffd5", width=3)
+        draw.line([(split_x, 0), (split_x, dim)], fill="#0969da", width=3)
 
         self.tk_split_img = ImageTk.PhotoImage(combined)
         self.canvas_split.delete("all")
@@ -1806,12 +1820,12 @@ class StringArtStudioApp(tk.Tk):
 
         self.fig_radon.clear()
         ax1 = self.fig_radon.add_subplot(1, 2, 1)
-        ax1.set_title("Синограмма Радона", color="#4fa3ff", fontsize=10)
+        ax1.set_title("Синограмма Радона", color="#0969da", fontsize=10)
         ax1.imshow(rg.sinogram, cmap='inferno', aspect='auto')
         ax1.axis('off')
 
         ax2 = self.fig_radon.add_subplot(1, 2, 2)
-        ax2.set_title("FBP Реконструкция (Ramp)", color="#00ffd5", fontsize=10)
+        ax2.set_title("FBP Реконструкция (Ramp)", color="#1f2328", fontsize=10)
         ax2.imshow(rg.fbp_recon, cmap='gray')
         ax2.axis('off')
 
