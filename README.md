@@ -1,13 +1,13 @@
-# String Art Studio Pro v9.0 🎨🧵
+# String Art Studio Pro v9.5 🎨🧵
 
 <div align="center">
 
 [![Python Version](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue?logo=python)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Algorithm](https://img.shields.io/badge/Algorithm-OMP%20%2B%20Island%20GA%20%2B%20Radon%20FBP-success)](#)
+[![Algorithm](https://img.shields.io/badge/Engine-CSR%20OMP%20%2B%20Island%20GA%20%2B%20Radon%20FBP-success)](#)
+[![GPU](https://img.shields.io/badge/GPU-PyTorch%20CUDA%20%2B%20SciPy%20CSR-76b900?logo=nvidia)](#)
 [![UI Theme](https://img.shields.io/badge/UI-Clean%20Light%20Theme-informational)](#)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/AYesRU/String-Art-Generator/pulls)
 
 **[English](#english) • [Русский](#русский)**
 
@@ -18,22 +18,33 @@
 <a name="english"></a>
 ## 🇬🇧 English
 
-**String Art Studio Pro v9.0** is an algorithmic suite and creative studio for generating high-definition **String Art** (thread art / filography / изонить) portraits and complex geometric artworks from continuous thread lines.
+**String Art Studio Pro v9.5** is an open-source algorithmic studio for generating high-definition **String Art** (thread art / filography / изонить) artworks from continuous thread paths — supporting both **Monochrome Black Thread** and **4-Layer Subtractive CMYK Color**.
 
-By bridging tomography mathematics (**Radon Transform & Filtered Back Projection**), **Orthogonal Matching Pursuit (OMP)**, multi-threaded **Island Genetic Algorithm (GA)**, and physical optical modeling based on the **Beer-Lambert law**, it produces crisp, high-contrast string compositions without noisy artifacts or over-darkened regions ("no mush").
+It combines tomography mathematics (**Radon Transform + Ram-Lak Filtered Back Projection**), a **3,000+ lines/sec SciPy CSR Orthogonal Matching Pursuit (OMP)** initializer with white-zone protection ("no mush"), a multi-threaded **Island Genetic Algorithm (GA)** with vectorized delta-coordinate memetic polishing, **PyTorch CUDA GPU** batch fitness evaluation (with seamless CPU fallback), and an additive **Beer-Lambert optical renderer** calibrated consistently from preview up to 2400×2400 Ultra-HD PNG.
 
 ### 🌟 Key Features
-* 🏝 **Multi-Threaded Island Genetic Algorithm**: Independent evolutionary threads with elite migration, graph mutations (*Smart Hinge*, *Radon Bridge*, *2-Opt Invert*, *Jitter Pin*), and coordinate-descent memetic polishing.
-* 📊 **Live Matplotlib Convergence & Mutation Analytics**: Real-time fitness curves for all islands with OMP baselines and horizontal KPI bar charts measuring mutation operator efficiency.
-* 👁 **Real-Time Visual Synthesis**: Progressive rendering on canvas during OMP synthesis (every 25 lines) and live evolutionary updates with frame-dropping protection.
-* ✨ **Dedicated "Evolution Polish" Mode**: Continue refining existing thread paths via Island GA without recomputing OMP from scratch.
-* 🌀 **Radon Transform & Ram-Lak FBP Filter**: Guides global thread placement to preserve delicate facial features, eyes, and sharp contours.
-* 🔊 **Physical Weaving Assistants**:
-  * **Windows SAPI Voice**: Hands-free voice instructions announcing nail target numbers in real time (*"to 142"*, *"to 89"*).
-  * **Interactive Step Scrubber**: Step-by-step slider with neon highlights and "Before / After" split curtain.
-  * **Autonomous HTML5 Web App**: Standalone `.html` file export with Web Speech API, keyboard controls, and local progress storage for tablets & mobile devices.
-* 📦 **Comprehensive Export Options**: Printable Ultra-HD `.png` (up to 2400x2400 with 4x SSAA), vector `.svg`, numbered sequence `.txt` with exact thread length calculations in meters.
-* ☀️ **Modern Light Theme**: Clean `#f6f8fa` interface with `#0969da` accents and high-contrast typography.
+* ⚡ **Ultra-Fast Hybrid Engine (CSR OMP + CUDA + Island GA)**:
+  * **CSR `pixel_gain` OMP**: Evaluates all candidate chords via sparse matrix-vector multiplication (`~3,200+ lines/sec` on CPU) while enforcing white-zone protection (`white_guard`).
+  * **PyTorch CUDA Batch Fitness**: Evaluates full island populations in parallel on NVIDIA GPUs (`~15 ms` for 24 chromosomes × 1,400 chords on RTX 5060) with automatic CPU fallback.
+  * **Island GA & Vectorized Delta-Search**: Independent island threads with elite migration and graph mutations (*Smart Hinge*, *Radon Bridge*, *2-Opt Invert*, *Jitter Pin*) plus vectorized coordinate-descent polishing.
+* 🎨 **6 Frame Geometries & CMYK Color**:
+  * **Shapes**: Circle, Square, Rectangle (4:3 & 16:9), Oval, Hexagon — with unified polygon masking and frame-fit image scaling.
+  * **Color Modes**: Classic **Monochrome** or **4-Layer Subtractive CMYK** (Cyan, Magenta, Yellow, Black).
+* 🌀 **Radon Transform & FBP Reconstruction**:
+  * Ram-Lak Ramp + Hamming frequency filtering and Filtered Back Projection (FBP) visualization tab, accurately aligned to chord `(rho, theta)` space.
+* 📊 **Live Matplotlib Analytics & Diagnostic Tabs**:
+  * Real-time island convergence curves, OMP baseline, mutation operator KPI bar chart, Error Map (Red/Blue), Thread Density Heatmap, DoG Saliency Map, and Radon + FBP view.
+* 🔊 **Interactive Physical Weaving Assistants**:
+  * **Built-in Step Player**: Interactive scrubber, layer switcher, neon active-chord highlight, Auto-Play, Before/After split curtain, and **Windows SAPI Voice** (`"на 142"`).
+  * **Autonomous HTML5 Web App**: Standalone `.html` export with Web Speech API, multi-layer CMYK tabs, real-time meterage, keyboard controls, and `localStorage` progress persistence.
+* 📦 **7 Export Formats**:
+  * `.txt` step-by-step map with cumulative meters & 500m spool estimate
+  * `.csv` coordinate/step table
+  * `.png` Ultra-HD 2400×2400 additive Beer-Lambert raster
+  * `.svg` layered vector drawing with pin markers
+  * `1:1 .svg` millimeter **Drill Template** with crosshairs and pin numbering
+  * `.gcode` CNC machine path scaled in millimeters
+  * `.html` standalone interactive Web Assistant
 
 ### 🚀 Quick Start
 ```bash
@@ -47,76 +58,49 @@ pip install -r requirements.txt
 # Run String Art Studio
 python string-art-generator.py
 ```
-*On Windows, simply double-click `run_studio.bat`.*
+*On Windows, you can also double-click `run_studio.bat`.*
+
+### 🧪 Running Tests
+```bash
+python -m unittest discover -s tests -v
+```
 
 ---
 
 <a name="русский"></a>
 ## 🇷🇺 Русский
 
-**String Art Studio Pro v9.0** — профессиональная студия и высокоточный алгоритмический комплекс для создания картин в технике **String Art** (изонить / филография) из одной непрерывной нити на основе математических методов томографии и эволюционного моделирования.
+**String Art Studio Pro v9.5** — студия и высокопроизводительный алгоритмический комплекс с открытым исходным кодом для генерации картин в технике **String Art** (изонить / филография) из непрерывной нити: как классических монохромных портретов, так и цветных **4-слойных CMYK** композиций.
 
-Программа объединяет преобразование Радона с высокочастотным фильтром Рама-Лака (Filtered Back Projection), высокоточный жадный OMP-синтез, параллельную островную модель генетического алгоритма и оптическое моделирование поглощения света по закону Бера-Ламберта.
+### 🌟 Ключевые возможности v9.5
 
----
+#### 1. ⚡ Гибридный движок: CSR OMP + PyTorch CUDA + Островной ГА
+* **Сверхбыстрый CSR OMP (~3 200+ нитей/сек на CPU)**: оценка всех допустимых хорд выполняется через разреженное матричное умножение `SciPy CSR` по вектору `pixel_gain` с жесткой защитой светлых тонов (`white_guard`) от серой «каши».
+* **Ускорение на GPU NVIDIA CUDA (PyTorch)**: пакетная оценка популяций хромосом на видеокарте (`~15 мс` на 24 хромосомы по 1 400 хорд на RTX 5060) с автоматическим откатом на CPU.
+* **Островная эволюция (`IslandThread`)**: независимые потоки с элитной миграцией, графовыми мутаторами (*Smart Hinge*, *Radon Bridge*, *2-Opt Invert*, *Jitter Pin*) и быстрым векторизованным дельта-спуском без зависимости от `numba`.
+* **Отдельная кнопка «✨ Доводка»**: запуск островной эволюции поверх уже сплетенного пути без перезапуска OMP.
 
-### 🌟 Подробный обзор возможностей v9.0
+#### 2. 📐 6 геометрий холста и 4-слойный CMYK
+* **Формы рамы**: Круг, Квадрат, Прямоугольник (4:3 и 16:9), Овал, Шестиугольник — с единой полигональной маской и точным вписыванием изображения в габариты рамы.
+* **Режимы цвета**: Монохром (черная нить) и Цветной CMYK (Циан, Маджента, Желтый, Черный) с физическим субтрактивным смешением по закону Бера-Ламберта.
+* **Пресеты и Авто-подбор**: готовые профили качества + интеллектуальный подбор параметров под контраст и детализацию изображения.
 
-#### 1. 🏝 Островная модель генетического алгоритма (Island GA)
-* **Параллельная многопоточная эволюция**: каждый вычислительный остров (`IslandThread`) работает в отдельном фоновом потоке со своей популяцией и обменивается элитными особями с другими островами через настраиваемый интервал миграций.
-* **Графовые операторы мутации высокого порядка**:
-  * **Smart Hinge** — локальное шарнирное перемещение гвоздя с аналитическим дельта-расчетом оптической невязки;
-  * **Radon Bridge** — топологический мост с использованием матрицы смежности синограммы Радона;
-  * **2-Opt Invert** — инверсия подпоследовательностей пути для распутывания неэффективных пересечений;
-  * **Jitter Pin** — фазовый микросдвиг для микроподгонки полутонов.
-* **Меметическая оптимизация**: координатный дельта-спуск для субмикронной полировки пути без застревания в локальных минимумах.
+#### 3. 🌀 Преобразование Радона (Ramp FBP) и аналитика
+* **Точная томографическая синограмма Радона** с фильтром Рама-Лака (окно Хэмминга) и визуализацией реконструкции FBP.
+* **Реальная метрика краев**: поддержка «Преобразование расстояний» (`distance_transform_edt`) и «Контуры» (Sobel + DoG + FineGrained Saliency).
+* **Живые графики Matplotlib**: кривая роста точности (Фитнес) с базовым уровнем OMP и КПД каждого оператора мутации.
+* **Разрешение-независимый рендер**: единая калибровка оптической плотности между превью (550px) и Ultra-HD экспортом (2400px).
 
-#### 2. 📊 Живая аналитика и динамические графики Matplotlib
-* **Кривая сходимости (Convergence Curve)**: отслеживание динамики фитнеса каждого острова в реальном времени с пунктирным базовым уровнем OMP.
-* **Гистограмма КПД операторов мутации (Mutation KPI)**: диаграмма результативности каждого мутатора (*Smart Hinge*, *Radon Bridge*, *2-Opt*, *Jitter Pin*).
-* Графика адаптирована под чистую светлую тему: белый фон (`#ffffff`), мягкая сетка (`#e1e4e8`), контрастные шрифты.
-
-#### 3. 👁 Визуализация в реальном времени (Real-Time Canvas)
-* **Прогрессивная отрисовка OMP-синтеза**: картина формируется на глазах пользователя (каждые 25 нитей и на каждом шаге для первых 30 нитей) — видно, как штрих за штрихом рождается изображение.
-* **Живое обновление эволюции**: каждое улучшение хромосомы немедленно визуализируется через выделенный поток рендеринга с интеллектуальным сбросом устаревших кадров (*Frame Dropping*), исключая лаги UI.
-* **Интерактивные аналитические вкладки**:
-  * `★ Лучший результат` — чистовой рендер картины с 4x субпиксельным сглаживанием;
-  * `Остров 1..4` — независимые результаты каждого острова;
-  * `Карта Ошибок (Кр/Син)` — красно-синяя матрица отклонения оптической плотности;
-  * `Плотность нитей (Heatmap)` — карта локального перенасыщения волокон;
-  * `Карта Значимости (DoG)` — разность гауссианов и взвешенные контуры лиц и глаз;
-  * `Синограмма Радона (FBP)` — томографическая проекция лучевых интегралов.
-
-#### 4. ✨ Выделенная кнопка «Эволюционная доводка»
-* Запуск параллельной островной эволюции **на уже построенном пути без сброса и повторного выполнения OMP**.
-* Позволяет дорабатывать картину в несколько подходов, изменяя на лету параметры мутаций и веса контуров.
-
-#### 5. ☀️ Современная светлая тема (Light Theme)
-* Полный редизайн интерфейса:
-  * Фон приложения: `#f6f8fa`
-  * Холсты и панели параметров: `#ffffff`
-  * Акцентный цвет: `#0969da`
-  * Текст и подписи: `#1f2328`
-  * Шрифты: системный Segoe UI.
-
-#### 6. 🌀 Преобразование Радона и фильтр Рама-Лака (FBP)
-* Вычисление синограммы интегральных проекций по направлениям углов.
-* Фильтрация проекций рамповым фильтром Рама-Лака ($|\omega|$) в частотной области Фурье.
-* Наведение нитей по синограмме Радона исключает образование темной "каши" и сохраняет черты лица и мелкие детали.
-
-#### 7. 🔊 Голосовой и интерактивный ассистент сборки
-* **Windows SAPI Голос**: встроенное голосовое озвучивание номеров целевых гвоздей для работы обеими руками без экрана (*"на 142"*, *"на 89"*).
-* **Интерактивный скраббер**: просмотр плетения от 1-й до последней нити с неоновой подсветкой активного хода.
-* **Шторка сравнения "До / После" (Split Compare)**: динамическое сопоставление исходного фото и картины нитями прямо поверх холста.
-
-#### 8. 🌐 Автономный интерактивный веб-ассистент (.html)
-* Экспорт автономного HTML5-файла со встроенной базой гвоздей, голосовым синтезом Web Speech API, горячими клавишами и сохранением прогресса в `localStorage`.
-
-#### 9. 📦 Полный комплекс экспорта
-* **.txt** — пошаговая карта плетения с точным расчетом расхода нити в метрах.
-* **.png Ultra HD** — печатный мастер-растр сверхвысокого разрешения (до 2400x2400px) с 4x SSAA сглаживанием.
-* **.svg** — масштабируемый векторный чертеж.
-* **.html** — автономный веб-помощник для планшета и смартфона.
+#### 4. 🔊 Интерактивный плеер и 7 форматов экспорта
+* **Студийный плеер**: ползунок шагов, кнопки `◀ Назад` / `▶ Авто` / `Вперед ▶`, переключение слоев CMYK, неоновая подсветка активной нити, шторка сравнения «До / После» и **голосовая диктовка через Windows SAPI**.
+* **Полный экспорт**:
+  * **.txt** — пошаговая схема с кумулятивным расходом нити в метрах и числом катушек (500м);
+  * **.csv** — таблица переходов с длинами сегментов;
+  * **.png (Ultra HD 2400×2400)** — аддитивный рендер по закону Бера-Ламберта;
+  * **.svg** — масштабируемый векторный чертеж по слоям;
+  * **Шаблон 1:1 (.svg)** — миллиметровый чертеж разметки и сверления гвоздей;
+  * **.gcode** — программа для ЧПУ-станка в миллиметрах;
+  * **.html** — автономный веб-ассистент для планшета/телефона с Web Speech API и сохранением прогресса в `localStorage`.
 
 ---
 
@@ -130,6 +114,23 @@ python string-art-generator.py
 
 ---
 
+## 📁 Структура проекта
+```
+StringArt_Studio/
+├── string-art-generator.py         # Точка входа приложения
+├── string_art_studio/
+│   ├── geometry.py                 # Геометрия 6 форм, CSR-матрица, аддитивный рендер
+│   ├── preprocessing.py            # Предобработка, маска, DoG/Saliency, CMYK, авто-подбор
+│   ├── radon.py                    # Синограмма Радона, фильтр Рама-Лака и FBP
+│   ├── engine.py                   # CSR OMP, CUDA/CPU Fitness, Island GA и дельта-поиск
+│   ├── audio.py                    # Голосовой диктор Windows SAPI
+│   ├── exporters.py                # TXT, CSV, G-Code, SVG, Шаблон 1:1, PNG, HTML5
+│   └── ui.py                       # Интерфейс (Light Theme), плеер, графики и координатор
+├── tests/                          # Автоматические тесты (unittest)
+├── requirements.txt
+└── run_studio.bat
+```
+
 ## 📄 Лицензия
-Распространяется под свободной лицензией [MIT](LICENSE).  
+Распространяется под лицензией [MIT](LICENSE).  
 Автор: **AYes (AYesRU)**.

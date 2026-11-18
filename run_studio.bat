@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 > nul
 cd /d "%~dp0"
-title String Art Studio Pro v9.0
+title String Art Studio Pro v9.5
 
 echo ========================================================
-echo   String Art Studio Pro v9.0 (Island GA + Fast NumPy)
+echo   String Art Studio Pro v9.5 (CSR + Island GA + CUDA)
 echo ========================================================
 echo.
 echo Запуск приложения...
