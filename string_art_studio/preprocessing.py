@@ -13,17 +13,22 @@ from PIL import Image
 from .geometry import CanvasManager
 
 
-def _composite_onto_white(pil_img: Image.Image) -> Image.Image:
-    """Корректно преобразует прозрачные RGBA/P изображения на чистый белый фон."""
+def _composite_onto_bg(pil_img: Image.Image, bg_rgb: Tuple[int, int, int] = (255, 255, 255)) -> Image.Image:
+    """Корректно преобразует прозрачные RGBA/P изображения на заданный сплошной фон."""
     if pil_img.mode in ("RGBA", "LA") or (pil_img.mode == "P" and "transparency" in pil_img.info):
         rgba = pil_img.convert("RGBA")
-        white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-        return Image.alpha_composite(white_bg, rgba).convert("RGB")
+        bg = Image.new("RGBA", rgba.size, (*bg_rgb, 255))
+        return Image.alpha_composite(bg, rgba).convert("RGB")
     return pil_img.convert("RGB")
 
 
+def _composite_onto_white(pil_img: Image.Image) -> Image.Image:
+    """Корректно преобразует прозрачные RGBA/P изображения на чистый белый фон."""
+    return _composite_onto_bg(pil_img, (255, 255, 255))
+
+
 def _fit_image_to_frame(
-    pil_img: Image.Image, target_size: int, shape: str
+    pil_img: Image.Image, target_size: int, shape: str, invert_board: bool = False
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Вписывает изображение в ограничивающий прямоугольник активной формы гвоздей
@@ -35,22 +40,27 @@ def _fit_image_to_frame(
     box_w = max(1, x1 - x0)
     box_h = max(1, y1 - y0)
 
-    rgb_src = np.array(_composite_onto_white(pil_img), dtype=np.uint8)
+    fill_val = 0 if invert_board else 255
+    rgb_src = np.array(_composite_onto_bg(pil_img, (fill_val, fill_val, fill_val)), dtype=np.uint8)
     src_h, src_w = rgb_src.shape[:2]
     scale = min(box_w / max(1, src_w), box_h / max(1, src_h))
     new_w = max(1, int(round(src_w * scale)))
     new_h = max(1, int(round(src_h * scale)))
 
     resized_rgb = cv2.resize(rgb_src, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    canvas_rgb = np.full((target_size, target_size, 3), 255, dtype=np.uint8)
+    canvas_rgb = np.full((target_size, target_size, 3), fill_val, dtype=np.uint8)
     off_x = x0 + (box_w - new_w) // 2
     off_y = y0 + (box_h - new_h) // 2
     canvas_rgb[off_y : off_y + new_h, off_x : off_x + new_w] = resized_rgb
 
-    # Зануляем область за пределами рамы гвоздей (чистый белый)
-    canvas_rgb = np.where(mask[:, :, None] == 255, canvas_rgb, 255)
+    # Зануляем область за пределами рамы гвоздей (чистый белый или черный фон доски)
+    canvas_rgb = np.where(mask[:, :, None] == 255, canvas_rgb, fill_val)
     canvas_gray = cv2.cvtColor(canvas_rgb, cv2.COLOR_RGB2GRAY)
     return canvas_rgb, canvas_gray, mask
+
+
+def _is_dark_board_mode(color_mode: str) -> bool:
+    return "Белая нить" in color_mode or "Темная" in color_mode
 
 
 def prepare_target_image_bundle(
@@ -62,12 +72,15 @@ def prepare_target_image_bundle(
     color_mode: str = "Монохром (Черная нить)",
 ) -> Dict[str, Any]:
     """
-    Полный конвейер предобработки: вписывание в геометрию рамы, очистка светлых зон,
-    построение карт контуров (Sobel), значимости (Saliency + DoG) и каналов (Mono / CMYK).
+    Полный конвейер предобработки: вписывание в геометрию рамы, очистка фоновых зон,
+    построение карт контуров (Sobel), значимости (Saliency + DoG) и каналов (Mono / Dark Board / CMYK).
     """
+    invert_board = _is_dark_board_mode(color_mode)
+
     if original_image is None:
-        empty_rgb = np.full((target_size, target_size, 3), 255, dtype=np.uint8)
-        empty_gray = np.full((target_size, target_size), 255, dtype=np.uint8)
+        fill_val = 18 if invert_board else 255
+        empty_rgb = np.full((target_size, target_size, 3), fill_val, dtype=np.uint8)
+        empty_gray = np.full((target_size, target_size), fill_val, dtype=np.uint8)
         empty_maps = np.zeros((target_size, target_size), dtype=np.uint8)
         empty_imp = np.ones((target_size, target_size), dtype=np.float32)
         return {
@@ -77,17 +90,19 @@ def prepare_target_image_bundle(
             "saliency": empty_maps,
             "importance": empty_imp,
             "mask": np.full((target_size, target_size), 255, dtype=np.uint8),
+            "invert_board": invert_board,
             "channels": [
                 {
-                    "name": "Черная нить",
-                    "color_hex": "#111111",
+                    "name": "Белая нить" if invert_board else "Черная нить",
+                    "color_hex": "#f5f5f5" if invert_board else "#111111",
                     "darkness": np.zeros((target_size, target_size), dtype=np.float32),
                     "importance": empty_imp,
+                    "edges": empty_maps,
                 }
             ],
         }
 
-    canvas_rgb, background, mask = _fit_image_to_frame(original_image, target_size, shape)
+    canvas_rgb, background, mask = _fit_image_to_frame(original_image, target_size, shape, invert_board=invert_board)
 
     # Мягкий билатеральный фильтр сохраняет зрачки/контуры и убирает шум кожи
     background = cv2.bilateralFilter(background, d=5, sigmaColor=22, sigmaSpace=22)
@@ -96,20 +111,22 @@ def prepare_target_image_bundle(
         clahe = cv2.createCLAHE(clipLimit=float(clahe_clip), tileGridSize=(8, 8))
         background = clahe.apply(background)
 
-    # Белая отсечка внутри маски, чтобы не плести серую "кашу" на светлых участках
+    # Отсечка фоновой зоны внутри маски, чтобы не плести "кашу" на пустом фоне
     inside_vals = background[mask == 255]
     if inside_vals.size > 0:
-        p_low, p_high = np.percentile(inside_vals, (4, 84))
+        p_bounds = (16, 96) if invert_board else (4, 84)
+        p_low, p_high = np.percentile(inside_vals, p_bounds)
         if p_high - p_low > 20:
             norm_float = (background.astype(np.float32) - p_low) / (p_high - p_low)
             background = np.clip(norm_float * 255.0, 0.0, 255.0).astype(np.uint8)
 
     if abs(gamma - 1.0) > 0.03:
-        inv_gamma = 1.0 / max(0.1, float(gamma))
+        inv_gamma = float(gamma) if invert_board else (1.0 / max(0.1, float(gamma)))
         table = np.array([((i / 255.0) ** inv_gamma) * 255.0 for i in range(256)], dtype=np.uint8)
         background = cv2.LUT(background, table)
 
-    background = np.where(mask == 255, background, 255)
+    exterior_val = 0 if invert_board else 255
+    background = np.where(mask == 255, background, exterior_val)
 
     # Карта контуров Собеля
     blurred = cv2.GaussianBlur(background, (3, 3), 0)
@@ -144,7 +161,9 @@ def prepare_target_image_bundle(
     importance = (combined_saliency * 3.5 + 0.6).astype(np.float32)
     importance = np.where(mask == 255, importance, 0.15).astype(np.float32)
 
-    channels = extract_channels(canvas_rgb, background, importance, mask, color_mode, gamma=gamma)
+    channels = extract_channels(
+        canvas_rgb, background, importance, mask, color_mode, gamma=gamma, edges=edges
+    )
 
     return {
         "rgb": canvas_rgb,
@@ -153,8 +172,33 @@ def prepare_target_image_bundle(
         "saliency": saliency_uint8,
         "importance": importance,
         "mask": mask,
+        "invert_board": invert_board,
         "channels": channels,
     }
+
+
+def _compute_channel_edges_and_importance(
+    ch_density: np.ndarray,
+    base_importance: np.ndarray,
+    mask: np.ndarray,
+    boost: float = 1.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Строит индивидуальную карту контуров Собеля и значимости для отдельного CMYK-канала."""
+    blur = cv2.GaussianBlur(ch_density.astype(np.float32), (3, 3), 0)
+    gx = cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.hypot(gx, gy)
+    grad = np.where(mask == 255, grad, 0.0)
+    max_g = float(np.max(grad))
+    if max_g > 1e-5:
+        grad_norm = grad / max_g
+    else:
+        grad_norm = np.zeros_like(ch_density, dtype=np.float32)
+
+    ch_edges = (grad_norm * 255.0).astype(np.uint8)
+    ch_imp = (0.55 * base_importance + 0.45 * (grad_norm * 3.5 + 0.6)) * float(boost)
+    ch_imp = np.where(mask == 255, ch_imp, 0.15).astype(np.float32)
+    return ch_edges, ch_imp
 
 
 def extract_channels(
@@ -164,8 +208,25 @@ def extract_channels(
     mask: np.ndarray,
     color_mode: str,
     gamma: float = 0.85,
+    edges: Optional[np.ndarray] = None,
 ) -> List[Dict[str, Any]]:
-    """Формирует список целевых слоев плотности (1 слой Монохром или 4 слоя CMYK)."""
+    """Формирует список целевых слоев плотности (Черная нить, Белая нить на темном или 4 слоя CMYK)."""
+    if edges is None:
+        edges = np.zeros_like(gray_target, dtype=np.uint8)
+
+    if _is_dark_board_mode(color_mode):
+        white_density = gray_target.astype(np.float32) / 255.0
+        white_density = np.where(mask == 255, white_density, 0.0).astype(np.float32)
+        return [
+            {
+                "name": "Белая нить",
+                "color_hex": "#f5f5f5",
+                "darkness": white_density,
+                "importance": importance,
+                "edges": edges,
+            }
+        ]
+
     if "CMYK" not in color_mode:
         mono_dark = (255.0 - gray_target.astype(np.float32)) / 255.0
         mono_dark = np.where(mask == 255, mono_dark, 0.0).astype(np.float32)
@@ -175,6 +236,7 @@ def extract_channels(
                 "color_hex": "#111111",
                 "darkness": mono_dark,
                 "importance": importance,
+                "edges": edges,
             }
         ]
 
@@ -200,11 +262,16 @@ def extract_channels(
         ch_arr[mask == 0] = 0.0
         ch_arr[ch_arr < 0.06] = 0.0
 
+    c_edges, c_imp = _compute_channel_edges_and_importance(c, importance, mask, boost=1.0)
+    m_edges, m_imp = _compute_channel_edges_and_importance(m, importance, mask, boost=1.0)
+    y_edges, y_imp = _compute_channel_edges_and_importance(y, importance, mask, boost=1.0)
+    k_edges, k_imp = _compute_channel_edges_and_importance(k, importance, mask, boost=1.15)
+
     return [
-        {"name": "Циан (Cyan)", "color_hex": "#00a8e8", "darkness": c.astype(np.float32), "importance": importance},
-        {"name": "Маджента (Magenta)", "color_hex": "#e6007a", "darkness": m.astype(np.float32), "importance": importance},
-        {"name": "Желтый (Yellow)", "color_hex": "#f5c400", "darkness": y.astype(np.float32), "importance": importance},
-        {"name": "Черный (Black)", "color_hex": "#111111", "darkness": k.astype(np.float32), "importance": (importance * 1.15).astype(np.float32)},
+        {"name": "Циан (Cyan)", "color_hex": "#00a8e8", "darkness": c.astype(np.float32), "importance": c_imp, "edges": c_edges},
+        {"name": "Маджента (Magenta)", "color_hex": "#e6007a", "darkness": m.astype(np.float32), "importance": m_imp, "edges": m_edges},
+        {"name": "Желтый (Yellow)", "color_hex": "#f5c400", "darkness": y.astype(np.float32), "importance": y_imp, "edges": y_edges},
+        {"name": "Черный (Black)", "color_hex": "#111111", "darkness": k.astype(np.float32), "importance": k_imp, "edges": k_edges},
     ]
 
 

@@ -35,6 +35,8 @@ class RadonGuide:
         edges_np: np.ndarray,
         canvas_manager: CanvasManager,
         config: Optional[Dict[str, Any]] = None,
+        compute_fbp: bool = True,
+        density_override: Optional[np.ndarray] = None,
     ):
         self.config = config or {"radon_enabled": True}
         self.canvas_manager = canvas_manager
@@ -46,7 +48,12 @@ class RadonGuide:
         self.top_neighbors_cache: List[np.ndarray] = []
 
         if self.config.get("radon_enabled", True):
-            self._compute_filtered_sinogram(target_image_np, edges_np)
+            self._compute_filtered_sinogram(
+                target_image_np,
+                edges_np,
+                compute_fbp=compute_fbp,
+                density_override=density_override,
+            )
 
     @staticmethod
     def _apply_ramp_filter(sinogram: np.ndarray) -> np.ndarray:
@@ -92,9 +99,18 @@ class RadonGuide:
             fbp = fbp[start : start + out_size, start : start + out_size]
         return fbp
 
-    def _compute_filtered_sinogram(self, target_image: np.ndarray, edges_np: np.ndarray) -> None:
+    def _compute_filtered_sinogram(
+        self,
+        target_image: np.ndarray,
+        edges_np: np.ndarray,
+        compute_fbp: bool = True,
+        density_override: Optional[np.ndarray] = None,
+    ) -> None:
         t0 = time.perf_counter()
-        darkness = (255.0 - target_image.astype(np.float32)) / 255.0
+        if density_override is not None:
+            darkness = np.clip(density_override.astype(np.float32, copy=False), 0.0, 1.0)
+        else:
+            darkness = (255.0 - target_image.astype(np.float32)) / 255.0
         edge_norm = edges_np.astype(np.float32) / 255.0
         hybrid_density = 0.65 * darkness + 0.35 * edge_norm
 
@@ -121,16 +137,17 @@ class RadonGuide:
         else:
             self.sinogram = filtered_sino.astype(np.float32)
 
-        # Реконструкция FBP для визуальной вкладки аналитики
-        try:
-            if SKIMAGE_AVAILABLE and iradon is not None:
-                fbp = iradon(raw_sino, theta=theta, filter_name="ramp", circle=use_circle, output_size=small_size)
-            else:
-                fbp = self._fallback_fbp_cv2(filtered_sino, theta, small_size)
-            fbp = np.maximum(0.0, fbp)
-            self.fbp_recon = cv2.normalize(fbp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        except Exception:
-            self.fbp_recon = np.zeros((small_size, small_size), dtype=np.uint8)
+        # Реконструкция FBP для визуальной вкладки аналитики (можно пропускать для доп. слоев CMYK)
+        if compute_fbp:
+            try:
+                if SKIMAGE_AVAILABLE and iradon is not None:
+                    fbp = iradon(raw_sino, theta=theta, filter_name="ramp", circle=use_circle, output_size=small_size)
+                else:
+                    fbp = self._fallback_fbp_cv2(filtered_sino, theta, small_size)
+                fbp = np.maximum(0.0, fbp)
+                self.fbp_recon = cv2.normalize(fbp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            except Exception:
+                self.fbp_recon = np.zeros((small_size, small_size), dtype=np.uint8)
 
         # Векторизованное проецирование всех допустимых хорд в координаты (rho, theta)
         num_pins = self.canvas_manager.num_pins
@@ -174,7 +191,7 @@ class RadonGuide:
 
             self.pin_adj_weights[i_arr, j_arr] = weights
             self.pin_adj_weights[j_arr, i_arr] = weights
-            self.line_weights = {(int(a), int(b)): float(w) for a, b, w in zip(i_arr, j_arr, weights)}
+            self.line_weights = dict(zip(zip(i_arr.tolist(), j_arr.tolist()), weights.tolist()))
 
         # Предвычисляем топ-36 лучших соседей для каждого гвоздя
         self.top_neighbors_cache = []
@@ -185,4 +202,4 @@ class RadonGuide:
             self.top_neighbors_cache.append(valid[:36].astype(np.int32))
 
         dt = time.perf_counter() - t0
-        logging.info(f"Преобразование Радона и FBP рассчитаны за {dt:.3f} сек.")
+        logging.info(f"Преобразование Радона{' и FBP' if compute_fbp else ''} рассчитано за {dt:.3f} сек.")

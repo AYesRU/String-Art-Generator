@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 Гибридный вычислительный движок String Art Studio Pro:
-- Сверхбыстрый OMP-синтез через SciPy CSR + pixel_gain (3500+ нитей/сек на CPU)
-- Пакетный расчет фитнеса на GPU NVIDIA CUDA (PyTorch) с авто-откатом на CPU
-- Островной генетический алгоритм (Island GA) с 4 графовыми мутаторами
-- Векторизованный локальный дельта-спуск (меметическая полировка)
+- Сверхбыстрый OMP-синтез через преднарезанные подматрицы SciPy CSR + pixel_gain (10,000+ нитей/сек на CPU)
+- Пакетный расчет фитнеса на GPU NVIDIA CUDA (PyTorch) с общим кэшем CSR в VRAM и авто-откатом на CPU
+- Островной генетический алгоритм (Island GA) с 4 графовыми мутаторами и проверкой границ кроссовера
+- Векторизованный O(L) дельта-спуск со scratch-буфером (меметическая полировка)
 """
 
+from collections import deque
 import logging
 import queue
 import random
@@ -131,27 +132,62 @@ def compute_delta_hinge_np(
     add2: np.ndarray,
     line_alpha: float,
     fearless_penalty: float,
+    scratch: Optional[np.ndarray] = None,
 ) -> Tuple[float, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Векторизованно вычисляет дельту ошибки (Delta L2) при замене A->B->C на A->X->C.
+    При передаче предвыделенного буфера scratch (int8, нули) работает за O(L) без сортировок np.unique.
     Не изменяет optical_depth на месте; возвращает (delta_err, affected_indices, new_depths).
     """
-    all_rem = np.concatenate((rem1, rem2))
-    all_add = np.concatenate((add1, add2))
-    affected = np.unique(np.concatenate((all_rem, all_add)))
-    if len(affected) == 0:
-        return 0.0, None, None
+    if scratch is not None:
+        if len(rem1) > 0:
+            scratch[rem1] -= 1
+        if len(rem2) > 0:
+            scratch[rem2] -= 1
+        if len(add1) > 0:
+            scratch[add1] += 1
+        if len(add2) > 0:
+            scratch[add2] += 1
 
-    rem_pos = np.searchsorted(affected, all_rem)
-    add_pos = np.searchsorted(affected, all_add)
-    net_steps = np.bincount(add_pos, minlength=len(affected)) - np.bincount(rem_pos, minlength=len(affected))
-    nonzero = net_steps != 0
-    if not np.any(nonzero):
-        return 0.0, None, None
+        af_parts: List[np.ndarray] = []
+        step_parts: List[np.ndarray] = []
+        # Каждая из 4 хорд DDA содержит строго уникальные пиксели; немедленное зануление
+        # гарантирует отсутствие двойного учета на пересечениях и чистый scratch на выходе.
+        for arr in (rem1, rem2, add1, add2):
+            if len(arr) == 0:
+                continue
+            vals = scratch[arr]
+            nz = vals != 0
+            if np.any(nz):
+                sub_idx = arr[nz]
+                af_parts.append(sub_idx)
+                step_parts.append(vals[nz])
+                scratch[sub_idx] = 0
 
-    af = affected[nonzero]
+        if not af_parts:
+            return 0.0, None, None
+
+        af = af_parts[0] if len(af_parts) == 1 else np.concatenate(af_parts)
+        net = step_parts[0] if len(step_parts) == 1 else np.concatenate(step_parts)
+    else:
+        all_rem = np.concatenate((rem1, rem2))
+        all_add = np.concatenate((add1, add2))
+        affected = np.unique(np.concatenate((all_rem, all_add)))
+        if len(affected) == 0:
+            return 0.0, None, None
+
+        rem_pos = np.searchsorted(affected, all_rem)
+        add_pos = np.searchsorted(affected, all_add)
+        net_steps = np.bincount(add_pos, minlength=len(affected)) - np.bincount(rem_pos, minlength=len(affected))
+        nonzero = net_steps != 0
+        if not np.any(nonzero):
+            return 0.0, None, None
+
+        af = affected[nonzero]
+        net = net_steps[nonzero]
+
     od = optical_depth[af]
-    nd = np.maximum(0.0, od + net_steps[nonzero].astype(np.float32) * float(line_alpha))
+    nd = np.maximum(0.0, od + net.astype(np.float32) * float(line_alpha))
 
     o_dark = 1.0 - np.exp(-od * 1.6)
     n_dark = 1.0 - np.exp(-nd * 1.6)
@@ -189,7 +225,7 @@ def prune_chromosome_loops(chromosome: List[int]) -> Tuple[List[int], int]:
 
 
 class GPUFitnessBackend:
-    """Потокобезопасный пакетный вычислитель фитнеса на CUDA (PyTorch)."""
+    """Потокобезопасный пакетный вычислитель фитнеса на CUDA (PyTorch) с общим кэшем матрицы в VRAM."""
 
     def __init__(
         self,
@@ -205,6 +241,8 @@ class GPUFitnessBackend:
         self.line_alpha = float(line_alpha)
         self.over_mult = float(1.0 + fearless_penalty * 1.8)
         self.flat_size = canvas_manager.size * canvas_manager.size
+        self._m_t_buf: Optional[Any] = None
+        self._m_t_cols: int = 0
 
         if not GPU_ENABLED_FLAG or torch is None or canvas_manager.line_matrix is None:
             return
@@ -212,27 +250,16 @@ class GPUFitnessBackend:
             return
 
         try:
-            import warnings
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                if hasattr(torch.sparse, "check_sparse_tensor_invariants"):
-                    torch.sparse.check_sparse_tensor_invariants(False)
-
-                self.device = torch.device("cuda")
-                a_t = canvas_manager.line_matrix.T.tocsr()
-                self.n_chords = canvas_manager.line_matrix.shape[0]
-
-                self.a_t_csr = torch.sparse_csr_tensor(
-                    torch.from_numpy(a_t.indptr.astype(np.int64)).to(self.device),
-                    torch.from_numpy(a_t.indices.astype(np.int64)).to(self.device),
-                    torch.from_numpy(a_t.data.astype(np.float32)).to(self.device),
-                    size=a_t.shape,
-                )
+            a_t_csr = canvas_manager.get_gpu_transposed_matrix()
+            if a_t_csr is None:
+                return
+            self.device = torch.device("cuda")
+            self.n_chords = canvas_manager.line_matrix.shape[0]
+            self.a_t_csr = a_t_csr
             self.target_gpu = torch.from_numpy(target_darkness_flat.astype(np.float32)).to(self.device).unsqueeze(1)
             self.imp_gpu = torch.from_numpy(importance_flat.astype(np.float32)).to(self.device).unsqueeze(1)
             self.available = True
-            logging.info(f"GPU CUDA бэкенд активирован: {CUDA_DEVICE_NAME}")
+            logging.info(f"GPU CUDA бэкенд активирован (общий кэш CSR): {CUDA_DEVICE_NAME}")
         except Exception as exc:
             logging.warning(f"Не удалось инициализировать CUDA бэкенд, откат на CPU: {exc}")
             self.available = False
@@ -243,26 +270,28 @@ class GPUFitnessBackend:
 
         batch_lids = [self.canvas_manager.chromosome_to_lids(c) for c in chromosomes]
         b = len(batch_lids)
-        if all(len(l) == 0 for l in batch_lids):
+        lengths = [len(l) for l in batch_lids]
+        total_nnz = sum(lengths)
+        if total_nnz == 0:
             return [0.0] * b
+
+        rows_np = np.concatenate([l for l in batch_lids if len(l) > 0]).astype(np.int64, copy=False)
+        cols_np = np.repeat(np.arange(b, dtype=np.int64), lengths)
 
         try:
             with self.lock:
-                m_t = torch.zeros((self.n_chords, b), device=self.device, dtype=torch.float32)
-                rows_list = []
-                cols_list = []
-                for col_i, lids in enumerate(batch_lids):
-                    if len(lids) > 0:
-                        rows_list.append(torch.from_numpy(lids.astype(np.int64)))
-                        cols_list.append(torch.full((len(lids),), col_i, dtype=torch.int64))
+                if self._m_t_buf is None or self._m_t_cols != b:
+                    self._m_t_buf = torch.zeros((self.n_chords, b), device=self.device, dtype=torch.float32)
+                    self._m_t_cols = b
+                else:
+                    self._m_t_buf.zero_()
 
-                if rows_list:
-                    r_cat = torch.cat(rows_list).to(self.device)
-                    c_cat = torch.cat(cols_list).to(self.device)
-                    vals = torch.full((r_cat.numel(),), self.line_alpha, device=self.device, dtype=torch.float32)
-                    m_t.index_put_((r_cat, c_cat), vals, accumulate=True)
+                r_cat = torch.from_numpy(rows_np).to(self.device, non_blocking=True)
+                c_cat = torch.from_numpy(cols_np).to(self.device, non_blocking=True)
+                vals = torch.full((total_nnz,), self.line_alpha, device=self.device, dtype=torch.float32)
+                self._m_t_buf.index_put_((r_cat, c_cat), vals, accumulate=True)
 
-                depths = torch.sparse.mm(self.a_t_csr, m_t)  # (flat_size, b)
+                depths = torch.sparse.mm(self.a_t_csr, self._m_t_buf)  # (flat_size, b)
                 cur_dark = 1.0 - torch.exp(-depths * 1.6)
                 diff = self.target_gpu - cur_dark
                 over = torch.where(cur_dark > self.target_gpu, self.over_mult, 1.0)
@@ -272,6 +301,7 @@ class GPUFitnessBackend:
         except Exception as exc:
             logging.warning(f"Ошибка пакетной оценки CUDA ({exc}), переключение на CPU.")
             self.available = False
+            self._m_t_buf = None
             return None
 
 
@@ -436,24 +466,34 @@ class GreedyInitializer:
             return []
 
         A = self.canvas_manager.line_matrix
+        pin_sub_matrices = self.canvas_manager.ensure_pin_sub_matrices()
         n_chords = A.shape[0]
         line_alpha = self.canvas_manager.get_line_alpha(num_lines, self.config.get("line_weight", 72))
         fearless = self.config.get("fearless_factor", 94) / 100.0
         radon_inf = (self.config.get("radon_influence", 35) / 100.0) * 0.22
 
-        # Предвычисляем константные по хордам знаменатель длины и штраф за светлые зоны
+        # Предвычисляем константные по хордам знаменатель длины и штраф за фоновые зоны
         chord_lengths = np.asarray(A.indptr[1:] - A.indptr[:-1], dtype=np.float32)
         chord_lengths_safe = np.maximum(1.0, chord_lengths)
-        norm_denom = chord_lengths_safe ** 0.90
+        inv_norm_denom = (1.0 / (chord_lengths_safe ** 0.90)).astype(np.float32)
 
         bright_mask = (self.target_darkness_flat < 0.08).astype(np.float32)
         bright_hits = A.dot(bright_mask)
         bright_ratio = bright_hits / chord_lengths_safe
-        bright_penalty = np.maximum(0.0, bright_ratio - 0.78) * chord_lengths_safe * (line_alpha * line_alpha) * fearless * 1.2
+        bright_penalty = (
+            np.maximum(0.0, bright_ratio - 0.78) * chord_lengths_safe * (line_alpha * line_alpha) * fearless * 1.2
+        ).astype(np.float32)
 
         radon_vec: Optional[np.ndarray] = None
         if self.radon_guide is not None and len(self.radon_guide.chord_weights) == n_chords and radon_inf > 0:
-            radon_vec = self.radon_guide.chord_weights
+            radon_vec = (1.0 + radon_inf * self.radon_guide.chord_weights).astype(np.float32)
+
+        # Предвычисляем массивы по каждому гвоздю один раз, убирая fancy-indexing внутри цикла OMP
+        pin_neighbor_pins = self.canvas_manager.pin_neighbor_pins
+        pin_neighbor_lids = self.canvas_manager.pin_neighbor_lids
+        pin_bright_pen = [bright_penalty[lids] for lids in pin_neighbor_lids]
+        pin_inv_norm = [inv_norm_denom[lids] for lids in pin_neighbor_lids]
+        pin_radon_mult = [radon_vec[lids] for lids in pin_neighbor_lids] if radon_vec is not None else None
 
         start_pin = 0
         if self.radon_guide and self.radon_guide.pin_adj_weights is not None and self.radon_guide.pin_adj_weights.size > 0:
@@ -468,9 +508,12 @@ class GreedyInitializer:
         pixel_gain = compute_pixel_gain_omp(residual, self.target_darkness_flat, self.importance_flat, line_alpha, fearless)
 
         used_lids = np.zeros(n_chords, dtype=bool)
-        recent_pins: List[int] = []
+        recent_pins: deque = deque()
+        recent_counts = np.zeros(self.num_pins, dtype=np.int32)
         auto_stop_step = min(400, max(60, int(num_lines * 0.45)))
         neg_streak = 0
+        a_indices = A.indices
+        a_indptr = A.indptr
 
         t0 = time.perf_counter()
         last_ui = t0
@@ -479,45 +522,44 @@ class GreedyInitializer:
             if self.stop_check and self.stop_check():
                 break
 
-            cand_pins = self.canvas_manager.pin_neighbor_pins[current_pin]
-            cand_lids = self.canvas_manager.pin_neighbor_lids[current_pin]
+            cand_pins = pin_neighbor_pins[current_pin]
+            cand_lids = pin_neighbor_lids[current_pin]
             if len(cand_lids) == 0:
                 break
 
             mask = ~used_lids[cand_lids]
             if recent_pins:
-                mask_rec = mask & ~np.isin(cand_pins, recent_pins)
+                mask_rec = mask & (recent_counts[cand_pins] == 0)
                 if np.any(mask_rec):
                     mask = mask_rec
 
             if not np.any(mask):
                 break
 
-            valid_pins = cand_pins[mask]
-            valid_lids = cand_lids[mask]
+            # Нулевое копирование CSR: перемножаем преднарезанную подматрицу pin_sub_matrices[current_pin]
+            raw_scores = pin_sub_matrices[current_pin].dot(pixel_gain)
+            scores = (raw_scores - pin_bright_pen[current_pin]) * pin_inv_norm[current_pin]
 
-            raw_scores = A[valid_lids].dot(pixel_gain)
-            scores = (raw_scores - bright_penalty[valid_lids]) / norm_denom[valid_lids]
-
-            if radon_vec is not None:
-                pos_s = scores > 0
+            if pin_radon_mult is not None:
+                pos_s = scores > 0.0
                 if np.any(pos_s):
-                    scores[pos_s] *= 1.0 + radon_inf * radon_vec[valid_lids[pos_s]]
+                    scores[pos_s] *= pin_radon_mult[current_pin][pos_s]
 
+            scores[~mask] = -np.inf
             best_idx = int(np.argmax(scores))
             best_score = float(scores[best_idx])
-            best_next = int(valid_pins[best_idx])
-            best_lid = int(valid_lids[best_idx])
+            best_next = int(cand_pins[best_idx])
+            best_lid = int(cand_lids[best_idx])
 
             if best_score <= 0.0001:
                 neg_streak += 1
                 if i >= auto_stop_step and neg_streak >= 14:
-                    logging.info(f"OMP Авто-стоп на шаге {i}: изображение сформировано без перетемнения.")
+                    logging.info(f"OMP Авто-стоп на шаге {i}: изображение сформировано без перенасыщения.")
                     break
             else:
                 neg_streak = 0
 
-            best_pixels = A.indices[A.indptr[best_lid] : A.indptr[best_lid + 1]]
+            best_pixels = a_indices[a_indptr[best_lid] : a_indptr[best_lid + 1]]
             if len(best_pixels) > 0:
                 residual[best_pixels] -= line_alpha
                 pixel_gain[best_pixels] = compute_pixel_gain_omp(
@@ -532,8 +574,10 @@ class GreedyInitializer:
             path.append(best_next)
 
             recent_pins.append(current_pin)
+            recent_counts[current_pin] += 1
             if len(recent_pins) > 6:
-                recent_pins.pop(0)
+                old_pin = recent_pins.popleft()
+                recent_counts[old_pin] -= 1
             current_pin = best_next
 
             now = time.perf_counter()
@@ -574,6 +618,7 @@ class IslandThread(threading.Thread):
         stages_override: Optional[int] = None,
         patience_scale: float = 1.0,
         layer_idx: int = 0,
+        run_id: int = 0,
     ):
         super().__init__(daemon=True, name=f"Island-{island_id + 1}")
         self.island_id = island_id
@@ -585,6 +630,7 @@ class IslandThread(threading.Thread):
         self.stages_override = stages_override
         self.patience_scale = float(patience_scale)
         self.layer_idx = int(layer_idx)
+        self.run_id = int(run_id)
         self.status_queue = queues["status_queue"]
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
@@ -686,17 +732,40 @@ class IslandThread(threading.Thread):
     def _graph_splice_crossover(self, p1: List[int], p2: List[int], start: int, end: int) -> List[int]:
         if len(p1) != len(p2) or end - start < 4:
             return list(p1)
-        child = list(p1)
-        cut = random.randint(start + 1, min(end - 1, len(p1) - 2))
-        child[cut:end] = p2[cut:end]
-        return child
+        num_pins = self.fitness_calculator.canvas_manager.num_pins
+        n = len(p1)
+        lo = max(1, start + 1)
+        hi = min(end - 1, n - 2)
+        if lo >= hi:
+            return list(p1)
+
+        for _ in range(8):
+            cut = random.randint(lo, hi)
+            # Проверяем левый стык p1[cut - 1] -> p2[cut]
+            if self._pin_dist(p1[cut - 1], p2[cut], num_pins) < self.min_pin_dist:
+                continue
+            # Подбираем допустимый правый стык cut2 (вплоть до end)
+            cut2 = min(end, n)
+            if cut2 < n and self._pin_dist(p2[cut2 - 1], p1[cut2], num_pins) < self.min_pin_dist:
+                if cut + 1 < cut2:
+                    alt_cut2 = random.randint(cut + 1, cut2 - 1)
+                    if self._pin_dist(p2[alt_cut2 - 1], p1[alt_cut2], num_pins) < self.min_pin_dist:
+                        continue
+                    cut2 = alt_cut2
+                else:
+                    continue
+            child = list(p1)
+            child[cut:cut2] = p2[cut:cut2]
+            return child
+
+        return list(p1)
 
     def _fast_delta_coordinate_descent(
         self, chromosome: List[int], start: int, end: int, depth: int
     ) -> Tuple[List[int], float]:
         """
-        Сверхбыстрая локальная полировка пути за счет векторизованного расчета дельты
-        и инкрементального отслеживания ошибки без пересчета всей хромосомы.
+        Сверхбыстрая локальная полировка пути за счет O(L) дельта-буфера (scratch)
+        и оценки пары кандидатов (Radon + локальный сдвиг) на каждом шаге.
         """
         if len(chromosome) < 4 or end - start < 3:
             return list(chromosome), self.fitness_calculator.calculate_single_fitness(chromosome)
@@ -719,6 +788,10 @@ class IslandThread(threading.Thread):
         if low_idx >= high_idx:
             return best_c, 1.0 - (total_err / flat_size)
 
+        scratch = np.zeros(len(target_dark), dtype=np.int8)
+        has_radon = bool(self.radon_guide and self.radon_guide.top_neighbors_cache)
+        shifts = (-4, -3, -2, -1, 1, 2, 3, 4)
+
         for _ in range(depth):
             if self.stop_event.is_set():
                 break
@@ -727,28 +800,60 @@ class IslandThread(threading.Thread):
             cur_p = best_c[idx]
             next_p = best_c[idx + 1]
 
-            if self.radon_guide and self.radon_guide.top_neighbors_cache and random.random() < 0.65:
+            # Формируем до 2 разных кандидатов (1 от Радона + 1 локальный сдвиг)
+            cand_list: List[int] = []
+            if has_radon:
                 cands = self.radon_guide.top_neighbors_cache[prev_p]
-                cand_p = int(cands[random.randint(0, min(9, len(cands) - 1))]) if len(cands) > 0 else random.randint(0, num_pins - 1)
-            else:
-                cand_p = (cur_p + random.choice([-4, -3, -2, -1, 1, 2, 3, 4])) % num_pins
+                if len(cands) > 0:
+                    c_rad = int(cands[random.randint(0, min(11, len(cands) - 1))])
+                    if (
+                        c_rad != cur_p
+                        and self._pin_dist(c_rad, prev_p, num_pins) >= self.min_pin_dist
+                        and self._pin_dist(c_rad, next_p, num_pins) >= self.min_pin_dist
+                    ):
+                        cand_list.append(c_rad)
 
-            if cand_p == cur_p:
-                continue
-            if self._pin_dist(cand_p, prev_p, num_pins) < self.min_pin_dist or self._pin_dist(cand_p, next_p, num_pins) < self.min_pin_dist:
+            c_jit = (cur_p + random.choice(shifts)) % num_pins
+            if (
+                c_jit != cur_p
+                and c_jit not in cand_list
+                and self._pin_dist(c_jit, prev_p, num_pins) >= self.min_pin_dist
+                and self._pin_dist(c_jit, next_p, num_pins) >= self.min_pin_dist
+            ):
+                cand_list.append(c_jit)
+
+            if not cand_list:
                 continue
 
             rem1 = cm.get_line_pixel_indices(prev_p, cur_p)
             rem2 = cm.get_line_pixel_indices(cur_p, next_p)
-            add1 = cm.get_line_pixel_indices(prev_p, cand_p)
-            add2 = cm.get_line_pixel_indices(cand_p, next_p)
 
-            delta_err, af, nd = compute_delta_hinge_np(
-                optical_depth, target_dark, importance, rem1, rem2, add1, add2, line_alpha, fearless
-            )
-            if delta_err < -1e-7 and af is not None and nd is not None:
+            best_delta = -1e-7
+            best_move: Optional[Tuple[int, np.ndarray, np.ndarray]] = None
+
+            for cand_p in cand_list:
+                add1 = cm.get_line_pixel_indices(prev_p, cand_p)
+                add2 = cm.get_line_pixel_indices(cand_p, next_p)
+                delta_err, af, nd = compute_delta_hinge_np(
+                    optical_depth,
+                    target_dark,
+                    importance,
+                    rem1,
+                    rem2,
+                    add1,
+                    add2,
+                    line_alpha,
+                    fearless,
+                    scratch=scratch,
+                )
+                if delta_err < best_delta and af is not None and nd is not None:
+                    best_delta = delta_err
+                    best_move = (cand_p, af, nd)
+
+            if best_move is not None:
+                cand_p, af, nd = best_move
                 optical_depth[af] = nd
-                total_err += delta_err
+                total_err += best_delta
                 best_c[idx] = cand_p
 
         return best_c, 1.0 - (total_err / flat_size)
@@ -881,6 +986,7 @@ class IslandThread(threading.Thread):
         if self.best_on_island:
             self.status_queue.put({
                 "type": "island_update",
+                "run_id": self.run_id,
                 "data": {
                     "id": self.island_id,
                     "layer_idx": self.layer_idx,
@@ -891,7 +997,11 @@ class IslandThread(threading.Thread):
             })
 
     def _send_generation_tick(self, stage: int, patience: int, limit: int) -> None:
-        self.status_queue.put({"type": "generation_tick", "data": (self.island_id, stage, patience, limit)})
+        self.status_queue.put({
+            "type": "generation_tick",
+            "run_id": self.run_id,
+            "data": (self.island_id, stage, patience, limit),
+        })
 
 
 class IslandManagerThread(threading.Thread):
@@ -907,6 +1017,7 @@ class IslandManagerThread(threading.Thread):
         emit_done: bool = True,
         stages_override: Optional[int] = None,
         patience_scale: float = 1.0,
+        run_id: int = 0,
     ):
         super().__init__(daemon=True, name=f"IslandManager-L{layer_idx}")
         self.config = config
@@ -919,6 +1030,7 @@ class IslandManagerThread(threading.Thread):
         self.emit_done = emit_done
         self.stages_override = stages_override
         self.patience_scale = patience_scale
+        self.run_id = int(run_id)
         self.islands: List[IslandThread] = []
         self.stop_event = threading.Event()
         self.status_queue = queues["status_queue"]
@@ -942,6 +1054,7 @@ class IslandManagerThread(threading.Thread):
             num_islands = max(1, self.config.get("num_islands", 3))
             self.status_queue.put({
                 "type": "status",
+                "run_id": self.run_id,
                 "data": f"Этап 2: Эволюционная полировка ({self.layer_name}) на {num_islands} островах...",
             })
             self.islands = [
@@ -955,6 +1068,7 @@ class IslandManagerThread(threading.Thread):
                     stages_override=self.stages_override,
                     patience_scale=self.patience_scale,
                     layer_idx=self.layer_idx,
+                    run_id=self.run_id,
                 )
                 for i in range(num_islands)
             ]
@@ -969,7 +1083,7 @@ class IslandManagerThread(threading.Thread):
                 time.sleep(0.15)
                 tick_count += 1
                 if tick_count % mig_interval == 0 and len(self.islands) > 1:
-                    self.status_queue.put({"type": "migration"})
+                    self.status_queue.put({"type": "migration", "run_id": self.run_id})
                     migrants = [isl.get_best_individual() for isl in self.islands]
                     if all(m is not None for m in migrants):
                         for i, isl in enumerate(self.islands):
@@ -984,7 +1098,7 @@ class IslandManagerThread(threading.Thread):
 
             if self.emit_done:
                 msg = "Остановлено пользователем." if self.stop_event.is_set() else "Генерация и полировка успешно завершены!"
-                self.status_queue.put({"type": "done", "data": msg})
+                self.status_queue.put({"type": "done", "run_id": self.run_id, "data": msg})
         except Exception:
             logging.error("Ошибка в IslandManagerThread", exc_info=True)
-            self.status_queue.put({"type": "error", "data": "Ошибка в диспетчере островов."})
+            self.status_queue.put({"type": "error", "run_id": self.run_id, "data": "Ошибка в диспетчере островов."})

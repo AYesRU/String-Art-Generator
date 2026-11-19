@@ -99,7 +99,7 @@ class TestEngineAndOptimizers(unittest.TestCase):
         path = greedy.run(80, lambda _s, _p: None)
         self.assertGreaterEqual(len(path), 30)
 
-        # Проверяем точность дельта-расчета (учитывая перекрывающиеся пиксели)
+        # Проверяем точность дельта-расчета (scratch-буфер vs эталон vs полный пересчет)
         depth = cm.compute_optical_depth_1d(path, fc_dt.line_alpha)
         err_before = fc_dt.calculate_total_error(depth)
         idx = 10
@@ -110,9 +110,25 @@ class TestEngineAndOptimizers(unittest.TestCase):
         add1 = cm.get_line_pixel_indices(prev_p, cand_p)
         add2 = cm.get_line_pixel_indices(cand_p, next_p)
 
-        delta_err, af, nd = compute_delta_hinge_np(
+        delta_err, _, _ = compute_delta_hinge_np(
             depth, fc_dt.target_darkness_flat, fc_dt.importance_flat, rem1, rem2, add1, add2, fc_dt.line_alpha, fc_dt.fearless_penalty
         )
+        scratch = np.zeros(len(depth), dtype=np.int8)
+        delta_scratch, _, _ = compute_delta_hinge_np(
+            depth,
+            fc_dt.target_darkness_flat,
+            fc_dt.importance_flat,
+            rem1,
+            rem2,
+            add1,
+            add2,
+            fc_dt.line_alpha,
+            fc_dt.fearless_penalty,
+            scratch=scratch,
+        )
+        self.assertEqual(int(np.count_nonzero(scratch)), 0)
+        self.assertAlmostEqual(delta_scratch, delta_err, places=5)
+
         new_path = list(path)
         new_path[idx] = cand_p
         depth_after = cm.compute_optical_depth_1d(new_path, fc_dt.line_alpha)
@@ -126,14 +142,25 @@ class TestEngineAndOptimizers(unittest.TestCase):
         self.assertGreaterEqual(f_after + 1e-6, f_before)
         self.assertAlmostEqual(f_after, fc_dt.calculate_single_fitness(polished), places=4)
 
-        # Проверка согласованности GPU и CPU, если CUDA доступна
+        # Проверка инварианта min_pin_dist при кроссовере на 200 случайных попытках
+        p2 = list(reversed(polished))
+        for _ in range(200):
+            child = isl._graph_splice_crossover(polished, p2, 0, len(polished) - 1)
+            self.assertEqual(len(child), len(polished))
+            for a, b in zip(child[:-1], child[1:]):
+                self.assertGreaterEqual(isl._pin_dist(a, b, cm.num_pins), isl.min_pin_dist)
+
+        # Проверка согласованности GPU и CPU + шаринга кэша CSR в VRAM
         if GPU_ENABLED_FLAG and fc_dt.gpu_backend.available:
+            self.assertIs(fc_dt.gpu_backend.a_t_csr, fc_edge.gpu_backend.a_t_csr)
             batch = [path, polished, path[::-1], polished[::-1]]
             gpu_scores = fc_dt.gpu_backend.evaluate_batch(batch)
             cpu_scores = [fc_dt.calculate_single_fitness(c) for c in batch]
             self.assertIsNotNone(gpu_scores)
             for gs, cs in zip(gpu_scores, cpu_scores):
                 self.assertAlmostEqual(gs, cs, places=4)
+            cm.release_gpu_cache()
+            self.assertIsNone(cm._gpu_a_t_csr)
 
     def test_prune_chromosome_loops(self):
         pruned, rem = prune_chromosome_loops([1, 2, 3, 2, 1, 5, 5, 6, 7, 6, 8])

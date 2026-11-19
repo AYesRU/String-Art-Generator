@@ -74,6 +74,71 @@ class TestGeometryAndPreprocessing(unittest.TestCase):
         self.assertGreaterEqual(rec["pins"], 220)
         self.assertGreaterEqual(rec["lines"], 950)
 
+    def test_dda_zero_duplicate_pixels_and_pin_sub_matrices(self):
+        for shape in CANVAS_SHAPES:
+            cm = CanvasManager(size=160, num_pins=72, shape=shape)
+            cm.build_line_tables()
+            A = cm.line_matrix
+            self.assertIsNotNone(A)
+            # Проверяем отсутствие дубликатов пикселей в КАЖДОЙ хорде
+            for lid in range(A.shape[0]):
+                row = A.indices[A.indptr[lid] : A.indptr[lid + 1]]
+                self.assertEqual(len(row), len(np.unique(row)), msg=f"Дубликаты в {shape}, chord {lid}")
+
+            sub_mats = cm.ensure_pin_sub_matrices()
+            self.assertEqual(len(sub_mats), cm.num_pins)
+            probe = np.linspace(0.1, 1.0, cm.size * cm.size, dtype=np.float32)
+            for pin_i in (0, 17, 50):
+                lids = cm.pin_neighbor_lids[pin_i]
+                np.testing.assert_allclose(sub_mats[pin_i].dot(probe), A[lids].dot(probe), atol=1e-4)
+
+    def test_dark_board_mode_and_cmyk_per_channel_contours(self):
+        # Темная доска: светлый круг на черном фоне
+        dark_img = Image.new("RGB", (200, 200), (5, 5, 5))
+        draw = ImageDraw.Draw(dark_img)
+        draw.ellipse((65, 65, 135, 135), fill=(245, 245, 245))
+
+        bundle_dark = prepare_target_image_bundle(
+            dark_img, 200, shape="Круг", color_mode="Белая нить (Темная доска)"
+        )
+        self.assertTrue(bundle_dark["invert_board"])
+        self.assertEqual(len(bundle_dark["channels"]), 1)
+        self.assertEqual(bundle_dark["channels"][0]["name"], "Белая нить")
+        self.assertEqual(float(bundle_dark["channels"][0]["darkness"][0, 0]), 0.0)
+        self.assertGreater(float(bundle_dark["channels"][0]["darkness"][100, 100]), 0.7)
+
+        cm = CanvasManager(size=400, num_pins=120, shape="Круг")
+        path = [(i * 37) % 120 for i in range(180)]
+        layers = [{"name": "Белая нить", "color_hex": "#f5f5f5", "path": path}]
+        rgb_400 = cm.render_layers_to_numpy(layers, output_size=400, invert_board=True)
+        rgb_1000 = cm.render_layers_to_numpy(layers, output_size=1000, invert_board=True)
+        # Угол доски темный, а внутри есть светлые нити
+        self.assertLessEqual(int(rgb_400[2, 2, 0]), 24)
+        self.assertGreater(float(np.mean(rgb_400)), 25.0)
+        self.assertAlmostEqual(float(np.mean(rgb_400)) / 255.0, float(np.mean(rgb_1000)) / 255.0, delta=0.05)
+
+        # CMYK индивидуальные контуры по каналам (красный квадрат слева, синий справа)
+        col_img = Image.new("RGB", (200, 200), (255, 255, 255))
+        d2 = ImageDraw.Draw(col_img)
+        d2.rectangle((45, 65, 95, 135), fill=(255, 10, 10))
+        d2.rectangle((105, 65, 155, 135), fill=(10, 10, 255))
+        bundle_cmyk = prepare_target_image_bundle(col_img, 200, shape="Квадрат", color_mode="Цветной CMYK (4 нити)")
+        c_ch, _, y_ch, _ = bundle_cmyk["channels"]
+        self.assertIn("edges", c_ch)
+        self.assertFalse(np.array_equal(c_ch["edges"], y_ch["edges"]))
+        self.assertFalse(np.allclose(c_ch["importance"], y_ch["importance"]))
+
+    def test_gpu_cpu_renderer_parity(self):
+        cm = CanvasManager(size=400, num_pins=120, shape="Круг")
+        if not cm._gpu_render_enabled:
+            self.skipTest("CUDA недоступен")
+        path = [(i * 41) % 120 for i in range(250)]
+        d_gpu = cm._accumulate_path_depth(path, len(path) - 1, 400, 1, 0.16)
+        cm._gpu_render_enabled = False
+        d_cpu = cm._accumulate_path_depth(path, len(path) - 1, 400, 1, 0.16)
+        cm.release_gpu_cache()
+        self.assertLess(float(np.max(np.abs(d_gpu - d_cpu))), 1e-3)
+
 
 if __name__ == "__main__":
     unittest.main()

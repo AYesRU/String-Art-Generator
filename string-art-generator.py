@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-String Art Studio Pro v9.5 — точка входа приложения.
-Гибридный комплекс: SciPy CSR OMP + Островной ГА (Island GA) + Преобразование Радона (Ramp FBP)
-+ Пакетное ускорение GPU CUDA (PyTorch) + CMYK/Монохром + Интерактивный плеер и SAPI Голос.
+String Art Studio Pro v9.6 — точка входа приложения.
+Гибридный комплекс: DDA CSR OMP + Островной ГА (Island GA) + Преобразование Радона (Ramp FBP)
++ Пакетное ускорение и рендер GPU CUDA (PyTorch) + Монохром / Темная доска / CMYK + Проекты .sart.json.
 """
 
 import logging
@@ -14,6 +14,7 @@ from tkinter import messagebox
 
 from string_art_studio import APP_TITLE, IMAGE_SIZE, MIN_PIN_DISTANCE, PRESETS, TOOLTIPS
 from string_art_studio.audio import AudioAssistant
+from string_art_studio.coordinator import AppState, EvolutionCoordinator
 from string_art_studio.engine import (
     FitnessCalculator,
     GreedyInitializer,
@@ -21,6 +22,7 @@ from string_art_studio.engine import (
     IslandThread,
     prune_chromosome_loops,
 )
+from string_art_studio.exporters import load_project_json, save_project_json
 from string_art_studio.geometry import CanvasManager
 from string_art_studio.preprocessing import (
     auto_recommend_parameters,
@@ -28,7 +30,7 @@ from string_art_studio.preprocessing import (
     prepare_target_image_bundle,
 )
 from string_art_studio.radon import RadonGuide
-from string_art_studio.ui import AppState, EvolutionCoordinator, StringArtApp, UIManager, main
+from string_art_studio.ui import StringArtApp, UIManager, main
 
 __all__ = [
     "APP_TITLE",
@@ -47,6 +49,8 @@ __all__ = [
     "prepare_target_image",
     "prepare_target_image_bundle",
     "auto_recommend_parameters",
+    "save_project_json",
+    "load_project_json",
     "AppState",
     "UIManager",
     "EvolutionCoordinator",

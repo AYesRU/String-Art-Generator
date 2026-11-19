@@ -45,6 +45,26 @@ class TestRadonGuide(unittest.TestCase):
             self.assertIsNotNone(rg.sinogram, msg=shape)
             self.assertEqual(rg.fbp_recon.shape, (250, 250), msg=shape)
 
+    def test_radon_density_override_and_skip_fbp(self):
+        size = 240
+        cm = CanvasManager(size=size, num_pins=96, shape="Круг")
+        cm.build_line_tables()
+
+        p_a, p_b = 12, 60
+        p_perp_a, p_perp_b = 36, 84
+        density = np.zeros((size, size), dtype=np.float32)
+        pt1 = tuple(np.round(cm.pin_coords[p_a]).astype(int))
+        pt2 = tuple(np.round(cm.pin_coords[p_b]).astype(int))
+        cv2.line(density, pt1, pt2, 1.0, thickness=4)
+        edges = (density * 255.0).astype(np.uint8)
+        dummy_gray = np.zeros((size, size), dtype=np.uint8)
+
+        rg = RadonGuide(dummy_gray, edges, cm, {"radon_enabled": True}, compute_fbp=False, density_override=density)
+        self.assertIsNotNone(rg.sinogram)
+        self.assertIsNone(rg.fbp_recon)
+        self.assertEqual(len(rg.top_neighbors_cache), cm.num_pins)
+        self.assertGreater(float(rg.pin_adj_weights[p_a, p_b]), float(rg.pin_adj_weights[p_perp_a, p_perp_b]) * 3.0)
+
 
 if __name__ == "__main__":
     unittest.main()
