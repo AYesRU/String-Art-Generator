@@ -24,6 +24,7 @@ from . import (
     STAGNATION_MUTATION_FACTOR,
 )
 from .geometry import CanvasManager, compute_min_pin_distance
+from .i18n import normalize_lang, to_canonical_metric, translate_layer_name
 from .radon import RadonGuide
 
 try:
@@ -83,6 +84,69 @@ def compute_pixel_gain_omp(
     return gain
 
 
+def compute_exact_beer_lambert_gain(
+    optical_depth: np.ndarray,
+    target_darkness: np.ndarray,
+    importance: np.ndarray,
+    line_alpha: float,
+    fearless_penalty: float,
+) -> np.ndarray:
+    """
+    Вычисляет точное поэлементное уменьшение ошибки Бера-Ламберта (e0 - e1) при добавлении одной нити.
+    Для любой хорды с уникальными пикселями сумма gain по хорде равна точному выигрышу фитнеса.
+    """
+    over_mult = 1.0 + float(fearless_penalty) * 1.8
+    c0 = 1.0 - np.exp(-optical_depth * 1.6)
+    c1 = 1.0 - np.exp(-(optical_depth + float(line_alpha)) * 1.6)
+    d0 = target_darkness - c0
+    d1 = target_darkness - c1
+    e0 = (d0 * d0) * importance * np.where(c0 > target_darkness, over_mult, 1.0)
+    e1 = (d1 * d1) * importance * np.where(c1 > target_darkness, over_mult, 1.0)
+    return (e0 - e1).astype(np.float32)
+
+
+def estimate_channel_line_budget(
+    target_darkness: np.ndarray,
+    mask: Optional[np.ndarray],
+    canvas_manager: CanvasManager,
+    max_lines: int,
+    line_weight_percent: int = 72,
+) -> int:
+    """
+    Вычисляет индивидуальный физический бюджет нитей для канала (0..max_lines)
+    по интегральной оптической глубине Бера-Ламберта внутри маски.
+    Отсутствующий в картине цвет (например, Cyan на красном изображении) получает бюджет 0.
+    """
+    max_l = max(0, int(max_lines))
+    if max_l == 0:
+        return 0
+
+    d = np.clip(target_darkness.astype(np.float32, copy=False), 0.0, 0.96)
+    if mask is not None:
+        m = mask.reshape(d.shape) == 255
+        d = np.where(m, d, 0.0)
+
+    active_px = int(np.sum(d > 0.06))
+    if active_px == 0:
+        return 0
+
+    line_alpha = canvas_manager.get_line_alpha(max_l, line_weight_percent)
+    if canvas_manager.line_matrix is not None and canvas_manager.line_matrix.shape[0] > 0:
+        A = canvas_manager.line_matrix
+        avg_chord_px = float(np.mean(A.indptr[1:] - A.indptr[:-1]))
+    else:
+        avg_chord_px = float(canvas_manager.size) * 0.65
+
+    tau_mass = float(np.sum(-np.log(1.0 - d) / 1.6))
+    mass_per_thread = max(1.0, avg_chord_px * line_alpha)
+    if tau_mass < mass_per_thread * 0.20:
+        return 0
+
+    raw_est = tau_mass / mass_per_thread
+    # Запас 1.8x + 35 нитей под геометрические перекрытия хорд; точный Beer-Lambert OMP остановится раньше при насыщении
+    return int(np.clip(round(raw_est * 1.80 + 35.0), 10, max_l))
+
+
 def evaluate_chromosome_1d_np(
     chromo_arr: np.ndarray,
     line_indices_flat: np.ndarray,
@@ -95,9 +159,10 @@ def evaluate_chromosome_1d_np(
     importance: np.ndarray,
     fearless_penalty: float,
 ) -> float:
-    """Быстрая оценка хромосомы на CPU через векторизованный np.bincount."""
+    """Быстрая оценка хромосомы на CPU через векторизованный np.bincount (корректна и для пустого пути)."""
     if len(chromo_arr) < 2:
-        return 0.0
+        err_empty = (target_darkness * target_darkness) * importance
+        return 1.0 - (float(np.sum(err_empty)) / float(flat_size))
     p1 = chromo_arr[:-1]
     p2 = chromo_arr[1:]
     valid = (p1 != p2) & (p1 >= 0) & (p1 < num_pins) & (p2 >= 0) & (p2 < num_pins)
@@ -122,40 +187,36 @@ def evaluate_chromosome_1d_np(
     return 1.0 - (float(np.sum(err)) / float(flat_size))
 
 
-def compute_delta_hinge_np(
+def _compute_delta_chords_np(
     optical_depth: np.ndarray,
     target_darkness: np.ndarray,
     importance: np.ndarray,
-    rem1: np.ndarray,
-    rem2: np.ndarray,
-    add1: np.ndarray,
-    add2: np.ndarray,
+    rem_chords: Tuple[np.ndarray, ...],
+    add_chords: Tuple[np.ndarray, ...],
     line_alpha: float,
     fearless_penalty: float,
     scratch: Optional[np.ndarray] = None,
 ) -> Tuple[float, Optional[np.ndarray], Optional[np.ndarray]]:
     """
-    Векторизованно вычисляет дельту ошибки (Delta L2) при замене A->B->C на A->X->C.
-    При передаче предвыделенного буфера scratch (int8, нули) работает за O(L) без сортировок np.unique.
-    Не изменяет optical_depth на месте; возвращает (delta_err, affected_indices, new_depths).
+    Универсальное O(L) ядро точной дельты ошибки Бера-Ламберта при удалении rem_chords и добавлении add_chords.
+    Используется для замены (hinge), удаления лишней нити (prune) и вставки новой нити (insert).
     """
+    non_empty_rem = [a for a in rem_chords if len(a) > 0]
+    non_empty_add = [a for a in add_chords if len(a) > 0]
+    if not non_empty_rem and not non_empty_add:
+        return 0.0, None, None
+
     if scratch is not None:
-        if len(rem1) > 0:
-            scratch[rem1] -= 1
-        if len(rem2) > 0:
-            scratch[rem2] -= 1
-        if len(add1) > 0:
-            scratch[add1] += 1
-        if len(add2) > 0:
-            scratch[add2] += 1
+        for arr in non_empty_rem:
+            scratch[arr] -= 1
+        for arr in non_empty_add:
+            scratch[arr] += 1
 
         af_parts: List[np.ndarray] = []
         step_parts: List[np.ndarray] = []
-        # Каждая из 4 хорд DDA содержит строго уникальные пиксели; немедленное зануление
-        # гарантирует отсутствие двойного учета на пересечениях и чистый scratch на выходе.
-        for arr in (rem1, rem2, add1, add2):
-            if len(arr) == 0:
-                continue
+        # Каждая DDA-хорда имеет строго уникальные индексы; немедленное зануление scratch
+        # гарантирует точный учет пересечений и полностью нулевой буфер после вызова.
+        for arr in (*non_empty_rem, *non_empty_add):
             vals = scratch[arr]
             nz = vals != 0
             if np.any(nz):
@@ -170,14 +231,14 @@ def compute_delta_hinge_np(
         af = af_parts[0] if len(af_parts) == 1 else np.concatenate(af_parts)
         net = step_parts[0] if len(step_parts) == 1 else np.concatenate(step_parts)
     else:
-        all_rem = np.concatenate((rem1, rem2))
-        all_add = np.concatenate((add1, add2))
+        all_rem = np.concatenate(non_empty_rem) if non_empty_rem else np.empty(0, dtype=np.int32)
+        all_add = np.concatenate(non_empty_add) if non_empty_add else np.empty(0, dtype=np.int32)
         affected = np.unique(np.concatenate((all_rem, all_add)))
         if len(affected) == 0:
             return 0.0, None, None
 
-        rem_pos = np.searchsorted(affected, all_rem)
-        add_pos = np.searchsorted(affected, all_add)
+        rem_pos = np.searchsorted(affected, all_rem) if len(all_rem) > 0 else np.empty(0, dtype=np.int64)
+        add_pos = np.searchsorted(affected, all_add) if len(all_add) > 0 else np.empty(0, dtype=np.int64)
         net_steps = np.bincount(add_pos, minlength=len(affected)) - np.bincount(rem_pos, minlength=len(affected))
         nonzero = net_steps != 0
         if not np.any(nonzero):
@@ -201,6 +262,88 @@ def compute_delta_hinge_np(
     err_n = (diff_n * diff_n) * w * np.where(n_dark > t, over_mult, 1.0)
     delta_err = float(np.sum(err_n - err_o))
     return delta_err, af, nd
+
+
+def compute_delta_hinge_np(
+    optical_depth: np.ndarray,
+    target_darkness: np.ndarray,
+    importance: np.ndarray,
+    rem1: np.ndarray,
+    rem2: np.ndarray,
+    add1: np.ndarray,
+    add2: np.ndarray,
+    line_alpha: float,
+    fearless_penalty: float,
+    scratch: Optional[np.ndarray] = None,
+) -> Tuple[float, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Векторизованно вычисляет дельту ошибки (Delta L2) при замене A->B->C на A->X->C.
+    При передаче предвыделенного буфера scratch (int8, нули) работает за O(L) без сортировок np.unique.
+    """
+    return _compute_delta_chords_np(
+        optical_depth,
+        target_darkness,
+        importance,
+        (rem1, rem2),
+        (add1, add2),
+        line_alpha,
+        fearless_penalty,
+        scratch=scratch,
+    )
+
+
+def compute_delta_remove_pin_np(
+    optical_depth: np.ndarray,
+    target_darkness: np.ndarray,
+    importance: np.ndarray,
+    rem1: np.ndarray,
+    rem2: np.ndarray,
+    add_bridge: np.ndarray,
+    line_alpha: float,
+    fearless_penalty: float,
+    scratch: Optional[np.ndarray] = None,
+) -> Tuple[float, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Точная O(L) дельта ошибки при удалении лишнего гвоздя B (схлопывание A->B->C в A->C
+    или удаление краевой хорды A->B при пустых rem2/add_bridge). Уменьшает число нитей на 1.
+    """
+    return _compute_delta_chords_np(
+        optical_depth,
+        target_darkness,
+        importance,
+        (rem1, rem2),
+        (add_bridge,),
+        line_alpha,
+        fearless_penalty,
+        scratch=scratch,
+    )
+
+
+def compute_delta_insert_pin_np(
+    optical_depth: np.ndarray,
+    target_darkness: np.ndarray,
+    importance: np.ndarray,
+    rem_bridge: np.ndarray,
+    add1: np.ndarray,
+    add2: np.ndarray,
+    line_alpha: float,
+    fearless_penalty: float,
+    scratch: Optional[np.ndarray] = None,
+) -> Tuple[float, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Точная O(L) дельта ошибки при вставке нового гвоздя X (разбиение A->C на A->X->C
+    или достраивание краевой хорды Z->X при пустых rem_bridge/add2). Увеличивает число нитей на 1.
+    """
+    return _compute_delta_chords_np(
+        optical_depth,
+        target_darkness,
+        importance,
+        (rem_bridge,),
+        (add1, add2),
+        line_alpha,
+        fearless_penalty,
+        scratch=scratch,
+    )
 
 
 def prune_chromosome_loops(chromosome: List[int]) -> Tuple[List[int], int]:
@@ -241,6 +384,9 @@ class GPUFitnessBackend:
         self.line_alpha = float(line_alpha)
         self.over_mult = float(1.0 + fearless_penalty * 1.8)
         self.flat_size = canvas_manager.size * canvas_manager.size
+        self.empty_fitness = 1.0 - float(np.sum((target_darkness_flat * target_darkness_flat) * importance_flat)) / float(
+            max(1, self.flat_size)
+        )
         self._m_t_buf: Optional[Any] = None
         self._m_t_cols: int = 0
 
@@ -273,7 +419,7 @@ class GPUFitnessBackend:
         lengths = [len(l) for l in batch_lids]
         total_nnz = sum(lengths)
         if total_nnz == 0:
-            return [0.0] * b
+            return [self.empty_fitness] * b
 
         rows_np = np.concatenate([l for l in batch_lids if len(l) > 0]).astype(np.int64, copy=False)
         cols_np = np.repeat(np.arange(b, dtype=np.int64), lengths)
@@ -342,16 +488,24 @@ class FitnessCalculator:
         edge_norm = (target_edges_2d.astype(np.float32) / 255.0).flatten()
 
         self.distance_transform_map: Optional[np.ndarray] = None
-        if config.get("structural_metric") == "Преобразование расстояний" and SCIPY_AVAILABLE and distance_transform_edt is not None:
-            # Сильные контуры задают минимальную дистанцию; их окрестность получает повышенный вес точности
-            edge_binary = np.where(target_edges_2d > 40, 0, 255).astype(np.uint8)
-            dt = distance_transform_edt(edge_binary).astype(np.float32)
-            max_dt = float(dt.max())
-            if max_dt > 0:
-                dt /= max_dt
-            self.distance_transform_map = dt
-            dt_affinity = ((1.0 - dt) ** 1.5).flatten()
-            structural_term = 0.55 * edge_norm + 0.45 * dt_affinity
+        if (
+            to_canonical_metric(str(config.get("structural_metric", ""))) == "Преобразование расстояний"
+            and SCIPY_AVAILABLE
+            and distance_transform_edt is not None
+        ):
+            if np.any(target_edges_2d > 40):
+                # Сильные контуры задают минимальную дистанцию; их окрестность получает повышенный вес точности
+                edge_binary = np.where(target_edges_2d > 40, 0, 255).astype(np.uint8)
+                dt = distance_transform_edt(edge_binary).astype(np.float32)
+                max_dt = float(dt.max())
+                if max_dt > 0:
+                    dt /= max_dt
+                self.distance_transform_map = dt
+                dt_affinity = ((1.0 - dt) ** 1.5).flatten()
+                structural_term = 0.55 * edge_norm + 0.45 * dt_affinity
+            else:
+                self.distance_transform_map = np.ones_like(target_edges_2d, dtype=np.float32)
+                structural_term = edge_norm
         else:
             structural_term = edge_norm
 
@@ -359,6 +513,8 @@ class FitnessCalculator:
 
         self.line_alpha = self.canvas_manager.get_line_alpha(config.get("lines", 1400), config.get("line_weight", 72))
         self.fearless_penalty = config.get("fearless_factor", 94) / 100.0
+        self.empty_error = float(np.sum((self.target_darkness_flat * self.target_darkness_flat) * self.importance_flat))
+        self.empty_fitness = 1.0 - self.empty_error / float(max(1, len(self.target_darkness_flat)))
 
         self.gpu_backend = GPUFitnessBackend(
             self.canvas_manager,
@@ -384,7 +540,7 @@ class FitnessCalculator:
 
     def calculate_single_fitness(self, chromosome: List[int]) -> float:
         if not chromosome or len(chromosome) < 2:
-            return 0.0
+            return self.empty_fitness
         arr = np.asarray(chromosome, dtype=np.int64)
         return float(
             evaluate_chromosome_1d_np(
@@ -461,28 +617,45 @@ class GreedyInitializer:
         num_lines: int,
         update_callback: Callable[[str, List[int]], None],
         layer_label: str = "черной нитью",
+        line_alpha: Optional[float] = None,
     ) -> List[int]:
-        if self.num_pins == 0 or self.canvas_manager.line_matrix is None or self.canvas_manager.line_matrix.shape[0] == 0:
+        """
+        Точный Beer-Lambert CSR OMP с автоматическим определением необходимого числа нитей:
+        - Если цвет/плотность отсутствует (ни одна хорда не уменьшает ошибку), возвращает [] (0 нитей).
+        - Останавливается сразу при исчерпании полезного вклада (без принудительного минимума)
+          и обрезает путь до префикса с минимальной точной ошибкой Бера-Ламберта.
+        """
+        max_l = max(0, int(num_lines))
+        lang = normalize_lang(self.config.get("language", "ru"))
+        disp_label = translate_layer_name(layer_label, lang)
+        if (
+            max_l == 0
+            or self.num_pins == 0
+            or self.canvas_manager.line_matrix is None
+            or self.canvas_manager.line_matrix.shape[0] == 0
+        ):
+            msg_zero = (
+                f"Layer ({disp_label}): no threads needed (0 threads)"
+                if lang == "en"
+                else f"Слой ({disp_label}): нити не требуются (0 нитей)"
+            )
+            update_callback(msg_zero, [])
             return []
 
         A = self.canvas_manager.line_matrix
         pin_sub_matrices = self.canvas_manager.ensure_pin_sub_matrices()
         n_chords = A.shape[0]
-        line_alpha = self.canvas_manager.get_line_alpha(num_lines, self.config.get("line_weight", 72))
+        if line_alpha is None:
+            ref_lines = int(self.config.get("lines", max_l))
+            alpha = self.canvas_manager.get_line_alpha(max(400, ref_lines), self.config.get("line_weight", 72))
+        else:
+            alpha = float(line_alpha)
         fearless = self.config.get("fearless_factor", 94) / 100.0
         radon_inf = (self.config.get("radon_influence", 35) / 100.0) * 0.22
 
-        # Предвычисляем константные по хордам знаменатель длины и штраф за фоновые зоны
         chord_lengths = np.asarray(A.indptr[1:] - A.indptr[:-1], dtype=np.float32)
         chord_lengths_safe = np.maximum(1.0, chord_lengths)
-        inv_norm_denom = (1.0 / (chord_lengths_safe ** 0.90)).astype(np.float32)
-
-        bright_mask = (self.target_darkness_flat < 0.08).astype(np.float32)
-        bright_hits = A.dot(bright_mask)
-        bright_ratio = bright_hits / chord_lengths_safe
-        bright_penalty = (
-            np.maximum(0.0, bright_ratio - 0.78) * chord_lengths_safe * (line_alpha * line_alpha) * fearless * 1.2
-        ).astype(np.float32)
+        inv_norm_denom = (1.0 / (chord_lengths_safe ** 0.85)).astype(np.float32)
 
         radon_vec: Optional[np.ndarray] = None
         if self.radon_guide is not None and len(self.radon_guide.chord_weights) == n_chords and radon_inf > 0:
@@ -491,26 +664,44 @@ class GreedyInitializer:
         # Предвычисляем массивы по каждому гвоздю один раз, убирая fancy-indexing внутри цикла OMP
         pin_neighbor_pins = self.canvas_manager.pin_neighbor_pins
         pin_neighbor_lids = self.canvas_manager.pin_neighbor_lids
-        pin_bright_pen = [bright_penalty[lids] for lids in pin_neighbor_lids]
         pin_inv_norm = [inv_norm_denom[lids] for lids in pin_neighbor_lids]
         pin_radon_mult = [radon_vec[lids] for lids in pin_neighbor_lids] if radon_vec is not None else None
 
-        start_pin = 0
-        if self.radon_guide and self.radon_guide.pin_adj_weights is not None and self.radon_guide.pin_adj_weights.size > 0:
-            start_pin = int(np.argmax(np.sum(self.radon_guide.pin_adj_weights, axis=1)))
-        elif self.canvas_manager.line_keys:
-            best_lid_init = int(np.argmax(A.dot(self.target_darkness_flat)))
-            start_pin = self.canvas_manager.line_keys[best_lid_init][0]
+        optical_depth = np.zeros_like(self.target_darkness_flat, dtype=np.float32)
+        pixel_gain = compute_exact_beer_lambert_gain(
+            optical_depth, self.target_darkness_flat, self.importance_flat, alpha, fearless
+        )
+        init_err = float(np.sum((self.target_darkness_flat * self.target_darkness_flat) * self.importance_flat))
+
+        # Проверяем, улучшает ли ХОТЯ БЫ ОДНА хорда точность относительно пустого холста
+        init_raw = A.dot(pixel_gain)
+        if float(np.max(init_raw)) <= 1e-5:
+            logging.info(f"CSR OMP ({layer_label}): цвет/сигнал отсутствует — 0 нитей.")
+            msg_empty = (
+                f"Layer ({disp_label}): color absent (0 threads)"
+                if lang == "en"
+                else f"Слой ({disp_label}): цвет отсутствует (0 нитей)"
+            )
+            update_callback(msg_empty, [])
+            return []
+
+        init_scores = init_raw * inv_norm_denom
+        if radon_vec is not None:
+            pos_init = init_scores > 0.0
+            if np.any(pos_init):
+                init_scores[pos_init] *= radon_vec[pos_init]
+        best_lid_init = int(np.argmax(init_scores))
+        start_pin = self.canvas_manager.line_keys[best_lid_init][0]
 
         path = [start_pin]
         current_pin = start_pin
-        residual = self.target_darkness_flat.copy()
-        pixel_gain = compute_pixel_gain_omp(residual, self.target_darkness_flat, self.importance_flat, line_alpha, fearless)
+        current_err = init_err
+        best_err = init_err
+        best_len = 0
 
         used_lids = np.zeros(n_chords, dtype=bool)
         recent_pins: deque = deque()
         recent_counts = np.zeros(self.num_pins, dtype=np.int32)
-        auto_stop_step = min(400, max(60, int(num_lines * 0.45)))
         neg_streak = 0
         a_indices = A.indices
         a_indptr = A.indptr
@@ -518,7 +709,7 @@ class GreedyInitializer:
         t0 = time.perf_counter()
         last_ui = t0
 
-        for i in range(num_lines):
+        for i in range(max_l):
             if self.stop_check and self.stop_check():
                 break
 
@@ -538,7 +729,7 @@ class GreedyInitializer:
 
             # Нулевое копирование CSR: перемножаем преднарезанную подматрицу pin_sub_matrices[current_pin]
             raw_scores = pin_sub_matrices[current_pin].dot(pixel_gain)
-            scores = (raw_scores - pin_bright_pen[current_pin]) * pin_inv_norm[current_pin]
+            scores = raw_scores * pin_inv_norm[current_pin]
 
             if pin_radon_mult is not None:
                 pos_s = scores > 0.0
@@ -547,31 +738,38 @@ class GreedyInitializer:
 
             scores[~mask] = -np.inf
             best_idx = int(np.argmax(scores))
-            best_score = float(scores[best_idx])
+            best_raw = float(raw_scores[best_idx])
             best_next = int(cand_pins[best_idx])
             best_lid = int(cand_lids[best_idx])
 
-            if best_score <= 0.0001:
+            # Небольшой допуск (до 8 ходов) позволяет перейти между раздельными пятнами цвета;
+            # если полезные нити не нашлись — останавливаемся и откатываем холостой хвост.
+            if best_raw <= 1e-5:
                 neg_streak += 1
-                if i >= auto_stop_step and neg_streak >= 14:
-                    logging.info(f"OMP Авто-стоп на шаге {i}: изображение сформировано без перенасыщения.")
+                if neg_streak >= 8:
+                    logging.info(f"OMP Авто-стоп ({layer_label}) на шаге {i}: оптимум достигнут без перенасыщения.")
                     break
             else:
                 neg_streak = 0
 
             best_pixels = a_indices[a_indptr[best_lid] : a_indptr[best_lid + 1]]
             if len(best_pixels) > 0:
-                residual[best_pixels] -= line_alpha
-                pixel_gain[best_pixels] = compute_pixel_gain_omp(
-                    residual[best_pixels],
+                current_err -= best_raw
+                optical_depth[best_pixels] += alpha
+                pixel_gain[best_pixels] = compute_exact_beer_lambert_gain(
+                    optical_depth[best_pixels],
                     self.target_darkness_flat[best_pixels],
                     self.importance_flat[best_pixels],
-                    line_alpha,
+                    alpha,
                     fearless,
                 )
 
             used_lids[best_lid] = True
             path.append(best_next)
+
+            if current_err < best_err - 1e-6:
+                best_err = current_err
+                best_len = len(path)
 
             recent_pins.append(current_pin)
             recent_counts[current_pin] += 1
@@ -581,19 +779,257 @@ class GreedyInitializer:
             current_pin = best_next
 
             now = time.perf_counter()
-            if (i < 30 or now - last_ui > 0.06 or i == num_lines - 1) and i > 0:
-                prog = int(((i + 1) / max(1, num_lines)) * 100)
+            if (i < 30 or now - last_ui > 0.06 or i == max_l - 1) and i > 0:
+                prog = int(((i + 1) / max(1, max_l)) * 100)
                 rate = (i + 1) / max(0.001, now - t0)
-                update_callback(
-                    f"Этап 1: CSR OMP ({layer_label}) {prog}% ({len(path) - 1} нитей, {rate:.0f} лин/с)",
-                    list(path),
+                msg_prog = (
+                    f"Stage 1: CSR OMP ({disp_label}) {prog}% ({len(path) - 1} threads, {rate:.0f} l/s)"
+                    if lang == "en"
+                    else f"Этап 1: CSR OMP ({disp_label}) {prog}% ({len(path) - 1} нитей, {rate:.0f} лин/с)"
                 )
+                update_callback(msg_prog, list(path))
                 last_ui = now
 
+        # Откатываем возможные отрицательные переходные хорды в хвосте до глобально лучшего префикса
+        if best_len < 2:
+            path = []
+        else:
+            path = path[:best_len]
+
         dt = time.perf_counter() - t0
-        logging.info(f"CSR OMP завершен ({layer_label}): {len(path) - 1} нитей за {dt:.2f} сек.")
-        update_callback(f"OMP-синтез завершен ({len(path) - 1} нитей)", list(path))
+        n_res = max(0, len(path) - 1)
+        logging.info(f"CSR OMP завершен ({layer_label}): {n_res} нитей (макс. {max_l}) за {dt:.2f} сек.")
+        msg_done = (
+            f"OMP synthesis complete ({disp_label}: {n_res} threads)"
+            if lang == "en"
+            else f"OMP-синтез завершен ({disp_label}: {n_res} нитей)"
+        )
+        update_callback(msg_done, list(path))
         return path
+
+
+def optimize_thread_count_delta(
+    chromosome: List[int],
+    fitness_calculator: FitnessCalculator,
+    max_lines: int,
+    radon_guide: Optional[RadonGuide] = None,
+    max_prune_passes: int = 2,
+    allow_add: bool = True,
+) -> Tuple[List[int], float, int, int]:
+    """
+    Двунаправленный точный O(L) алгоритм адаптации числа нитей:
+    1) Уменьшает число нитей при их избытке (схлопывание A->B->C -> A->C и удаление краевых хорд,
+       вплоть до 0 нитей, если пустой слой точнее).
+    2) Добавляет недостающие нити при их нехватке (точное Beer-Lambert наращивание строго <= max_lines).
+    Возвращает (новый_путь, новый_фитнес, удалено_нитей, добавлено_нитей).
+    """
+    cm = fitness_calculator.canvas_manager
+    cm.build_line_tables()
+    num_pins = cm.num_pins
+    min_pin_dist = compute_min_pin_distance(num_pins)
+    alpha = fitness_calculator.line_alpha
+    fearless = fitness_calculator.fearless_penalty
+    target_dark = fitness_calculator.target_darkness_flat
+    importance = fitness_calculator.importance_flat
+    flat_size = float(len(target_dark))
+    max_l = max(0, int(max_lines))
+
+    def _pdist(a: int, b: int) -> int:
+        d = abs(a - b)
+        return min(d, num_pins - d)
+
+    path, loops_removed = prune_chromosome_loops(list(chromosome))
+    removed_count = loops_removed
+    added_count = 0
+
+    # Жестко ограничиваем сверху, если исходный путь длиннее нового max_lines
+    if len(path) - 1 > max_l:
+        removed_count += (len(path) - 1) - max_l
+        path = path[: max_l + 1] if max_l > 0 else []
+
+    optical_depth = cm.compute_optical_depth_1d(path, alpha)
+    total_err = fitness_calculator.calculate_total_error(optical_depth)
+    scratch = np.zeros(len(target_dark), dtype=np.int8)
+    empty_arr = np.empty(0, dtype=np.int32)
+
+    # ФАЗА 1: Удаление избыточных нитей (уменьшение длины пути при перенасыщении)
+    for _ in range(max(1, int(max_prune_passes))):
+        pass_removed = 0
+
+        # Удаляем вредные краевые хорды с конца и начала
+        while len(path) >= 2:
+            rem_tail = cm.get_line_pixel_indices(path[-2], path[-1])
+            d_err, af, nd = compute_delta_remove_pin_np(
+                optical_depth, target_dark, importance, rem_tail, empty_arr, empty_arr, alpha, fearless, scratch=scratch
+            )
+            if d_err < -1e-6 and af is not None and nd is not None:
+                optical_depth[af] = nd
+                total_err += d_err
+                path.pop()
+                removed_count += 1
+                pass_removed += 1
+            else:
+                break
+
+        while len(path) >= 2:
+            rem_head = cm.get_line_pixel_indices(path[0], path[1])
+            d_err, af, nd = compute_delta_remove_pin_np(
+                optical_depth, target_dark, importance, rem_head, empty_arr, empty_arr, alpha, fearless, scratch=scratch
+            )
+            if d_err < -1e-6 and af is not None and nd is not None:
+                optical_depth[af] = nd
+                total_err += d_err
+                path.pop(0)
+                removed_count += 1
+                pass_removed += 1
+            else:
+                break
+
+        # Сканируем внутренние гвозди: схлопывание A->B->C в A->C
+        idx = 1
+        while idx < len(path) - 1:
+            prev_p, cur_p, next_p = path[idx - 1], path[idx], path[idx + 1]
+            if prev_p == next_p:
+                rem1 = cm.get_line_pixel_indices(prev_p, cur_p)
+                rem2 = cm.get_line_pixel_indices(cur_p, next_p)
+                d_err, af, nd = compute_delta_remove_pin_np(
+                    optical_depth, target_dark, importance, rem1, rem2, empty_arr, alpha, fearless, scratch=scratch
+                )
+                if d_err <= 1e-6:
+                    if af is not None and nd is not None:
+                        optical_depth[af] = nd
+                    total_err += d_err
+                    del path[idx : idx + 2]
+                    removed_count += 2
+                    pass_removed += 2
+                    continue
+            elif _pdist(prev_p, next_p) >= min_pin_dist:
+                rem1 = cm.get_line_pixel_indices(prev_p, cur_p)
+                rem2 = cm.get_line_pixel_indices(cur_p, next_p)
+                bridge = cm.get_line_pixel_indices(prev_p, next_p)
+                d_err, af, nd = compute_delta_remove_pin_np(
+                    optical_depth, target_dark, importance, rem1, rem2, bridge, alpha, fearless, scratch=scratch
+                )
+                if d_err < -1e-6 and af is not None and nd is not None:
+                    optical_depth[af] = nd
+                    total_err += d_err
+                    del path[idx]
+                    removed_count += 1
+                    pass_removed += 1
+                    continue
+            idx += 1
+
+        if pass_removed == 0:
+            break
+
+    # Если пустой слой лучше или равен оставшемуся пути — полностью очищаем слой (0 нитей)
+    if len(path) < 2 or total_err >= fitness_calculator.empty_error - 1e-6:
+        removed_count += max(0, len(path) - 1)
+        path = []
+        optical_depth.fill(0.0)
+        total_err = fitness_calculator.empty_error
+
+    # ФАЗА 2: Добавление недостающих нитей при дефиците (строго не больше max_lines)
+    if allow_add and max_l > 0 and max(0, len(path) - 1) < max_l and cm.line_matrix is not None and cm.line_matrix.shape[0] > 0:
+        A = cm.line_matrix
+        pin_sub_matrices = cm.ensure_pin_sub_matrices()
+        n_chords = A.shape[0]
+        radon_inf = (fitness_calculator.config.get("radon_influence", 35) / 100.0) * 0.22
+        chord_lengths = np.maximum(1.0, (A.indptr[1:] - A.indptr[:-1]).astype(np.float32))
+        inv_norm = (1.0 / (chord_lengths ** 0.85)).astype(np.float32)
+        pin_inv_norm = [inv_norm[lids] for lids in cm.pin_neighbor_lids]
+        radon_vec = (
+            (1.0 + radon_inf * radon_guide.chord_weights).astype(np.float32)
+            if (radon_guide is not None and len(radon_guide.chord_weights) == n_chords and radon_inf > 0)
+            else None
+        )
+        pin_radon_mult = [radon_vec[lids] for lids in cm.pin_neighbor_lids] if radon_vec is not None else None
+
+        pixel_gain = compute_exact_beer_lambert_gain(optical_depth, target_dark, importance, alpha, fearless)
+        used_lids = np.zeros(n_chords, dtype=bool)
+        if len(path) >= 2:
+            existing_lids = cm.chromosome_to_lids(path)
+            if len(existing_lids) > 0:
+                used_lids[existing_lids] = True
+
+        a_indices = A.indices
+        a_indptr = A.indptr
+
+        # Если путь был пуст, проверяем, нужна ли хотя бы одна стартовая хорда
+        if len(path) < 2:
+            init_raw = A.dot(pixel_gain)
+            if float(np.max(init_raw)) > 1e-5:
+                init_scores = init_raw * inv_norm
+                if radon_vec is not None:
+                    pos_i = init_scores > 0.0
+                    if np.any(pos_i):
+                        init_scores[pos_i] *= radon_vec[pos_i]
+                best_lid0 = int(np.argmax(init_scores))
+                if float(init_raw[best_lid0]) > 1e-5:
+                    p_a, p_b = cm.line_keys[best_lid0]
+                    pix = a_indices[a_indptr[best_lid0] : a_indptr[best_lid0 + 1]]
+                    total_err -= float(init_raw[best_lid0])
+                    optical_depth[pix] += alpha
+                    pixel_gain[pix] = compute_exact_beer_lambert_gain(
+                        optical_depth[pix], target_dark[pix], importance[pix], alpha, fearless
+                    )
+                    used_lids[best_lid0] = True
+                    path = [p_a, p_b]
+                    added_count += 1
+
+        if len(path) >= 2:
+            recent_pins: deque = deque(path[-6:])
+            recent_counts = np.zeros(num_pins, dtype=np.int32)
+            for rp in recent_pins:
+                if 0 <= rp < num_pins:
+                    recent_counts[rp] += 1
+            current_pin = path[-1]
+
+            while len(path) - 1 < max_l:
+                cand_pins = cm.pin_neighbor_pins[current_pin]
+                cand_lids = cm.pin_neighbor_lids[current_pin]
+                if len(cand_lids) == 0:
+                    break
+                mask = ~used_lids[cand_lids]
+                if recent_pins:
+                    mask_rec = mask & (recent_counts[cand_pins] == 0)
+                    if np.any(mask_rec):
+                        mask = mask_rec
+                if not np.any(mask):
+                    break
+
+                raw = pin_sub_matrices[current_pin].dot(pixel_gain)
+                scores = raw * pin_inv_norm[current_pin]
+                if pin_radon_mult is not None:
+                    pos_s = scores > 0.0
+                    if np.any(pos_s):
+                        scores[pos_s] *= pin_radon_mult[current_pin][pos_s]
+                scores[~mask] = -np.inf
+                bi = int(np.argmax(scores))
+                b_raw = float(raw[bi])
+                if b_raw <= 1e-5:
+                    break
+
+                b_next = int(cand_pins[bi])
+                b_lid = int(cand_lids[bi])
+                pix = a_indices[a_indptr[b_lid] : a_indptr[b_lid + 1]]
+                total_err -= b_raw
+                optical_depth[pix] += alpha
+                pixel_gain[pix] = compute_exact_beer_lambert_gain(
+                    optical_depth[pix], target_dark[pix], importance[pix], alpha, fearless
+                )
+                used_lids[b_lid] = True
+                path.append(b_next)
+                added_count += 1
+
+                recent_pins.append(current_pin)
+                recent_counts[current_pin] += 1
+                if len(recent_pins) > 6:
+                    old_p = recent_pins.popleft()
+                    recent_counts[old_p] -= 1
+                current_pin = b_next
+
+    return path, 1.0 - (total_err / flat_size), removed_count, added_count
 
 
 # ----------------------------------------------------------------------
@@ -603,8 +1039,10 @@ class GreedyInitializer:
 
 class IslandThread(threading.Thread):
     """
-    Поток острова эволюционной доводки: графовые мутации (Smart Hinge, Radon Bridge,
-    2-Opt Invert, Jitter Pin) и быстрый векторизованный дельта-поиск.
+    Поток острова эволюционной доводки переменной длины:
+    - 6 графовых мутаторов (Smart Hinge, Radon Bridge, 2-Opt Invert, Jitter Pin, Prune Excess, Insert Thread)
+    - Кроссовер хромосом переменной длины с проверкой стыков min_pin_dist
+    - Быстрый O(L) дельта-поиск (замена, удаление избыточных нитей и вставка недостающих в пределах max_lines).
     """
 
     def __init__(
@@ -619,6 +1057,7 @@ class IslandThread(threading.Thread):
         patience_scale: float = 1.0,
         layer_idx: int = 0,
         run_id: int = 0,
+        max_lines: Optional[int] = None,
     ):
         super().__init__(daemon=True, name=f"Island-{island_id + 1}")
         self.island_id = island_id
@@ -631,6 +1070,7 @@ class IslandThread(threading.Thread):
         self.patience_scale = float(patience_scale)
         self.layer_idx = int(layer_idx)
         self.run_id = int(run_id)
+        self.max_lines = max(0, int(max_lines if max_lines is not None else config.get("lines", 1400)))
         self.status_queue = queues["status_queue"]
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
@@ -645,6 +1085,8 @@ class IslandThread(threading.Thread):
             "Radon Bridge": self._radon_bridge_mutation,
             "2-Opt Invert": self._two_opt_mutation,
             "Jitter Pin": self._jitter_pin_mutation,
+            "Prune Excess": self._prune_excess_mutation,
+            "Insert Thread": self._insert_thread_mutation,
         }
         self.mutation_stats = {name: {"success": 1, "attempts": 1} for name in self.mutation_operators.keys()}
 
@@ -668,10 +1110,20 @@ class IslandThread(threading.Thread):
         d = abs(a - b)
         return min(d, num_pins - d)
 
+    def _safe_interior_range(self, c: List[int], s: int, e: int) -> Optional[Tuple[int, int]]:
+        if len(c) < 3:
+            return None
+        hi = min(len(c) - 2, max(1, e - 1))
+        lo = max(1, min(s, hi))
+        if lo > hi:
+            return None
+        return lo, hi
+
     def _smart_hinge_mutation(self, c: List[int], s: int, e: int) -> List[int]:
-        if e - s < 3:
+        rng = self._safe_interior_range(c, s, e)
+        if rng is None:
             return c
-        idx = random.randint(max(1, s), min(len(c) - 2, e - 1))
+        idx = random.randint(rng[0], rng[1])
         prev_p, next_p = c[idx - 1], c[idx + 1]
         num_pins = self.fitness_calculator.canvas_manager.num_pins
         for _ in range(10):
@@ -682,9 +1134,12 @@ class IslandThread(threading.Thread):
         return c
 
     def _radon_bridge_mutation(self, c: List[int], s: int, e: int) -> List[int]:
-        if e - s < 3 or self.radon_guide is None or not self.radon_guide.top_neighbors_cache:
+        if self.radon_guide is None or not self.radon_guide.top_neighbors_cache:
             return self._smart_hinge_mutation(c, s, e)
-        idx = random.randint(max(1, s), min(len(c) - 2, e - 1))
+        rng = self._safe_interior_range(c, s, e)
+        if rng is None:
+            return c
+        idx = random.randint(rng[0], rng[1])
         prev_p, next_p = c[idx - 1], c[idx + 1]
         num_pins = self.fitness_calculator.canvas_manager.num_pins
         candidates = self.radon_guide.top_neighbors_cache[prev_p]
@@ -703,11 +1158,18 @@ class IslandThread(threading.Thread):
         return c
 
     def _two_opt_mutation(self, c: List[int], s: int, e: int) -> List[int]:
-        if e - s < 4:
+        if len(c) < 5:
             return c
         num_pins = self.fitness_calculator.canvas_manager.num_pins
-        i1 = random.randint(max(1, s), min(len(c) - 4, e - 3))
-        i2 = random.randint(i1 + 2, min(len(c) - 1, e, i1 + 25))
+        hi1 = min(len(c) - 4, max(1, e - 3))
+        lo1 = max(1, min(s, hi1))
+        if lo1 > hi1:
+            return c
+        i1 = random.randint(lo1, hi1)
+        hi2 = min(len(c) - 1, max(i1 + 2, e), i1 + 25)
+        if i1 + 2 > hi2:
+            return c
+        i2 = random.randint(i1 + 2, hi2)
         # Проверяем, не создаст ли инверсия слишком короткие граничные хорды
         if self._pin_dist(c[i1 - 1], c[i2 - 1], num_pins) < self.min_pin_dist:
             return c
@@ -717,9 +1179,10 @@ class IslandThread(threading.Thread):
         return c
 
     def _jitter_pin_mutation(self, c: List[int], s: int, e: int) -> List[int]:
-        if e - s < 2:
+        rng = self._safe_interior_range(c, s, e)
+        if rng is None:
             return c
-        idx = random.randint(max(1, s), min(len(c) - 2, e - 1))
+        idx = random.randint(rng[0], rng[1])
         prev_p, next_p = c[idx - 1], c[idx + 1]
         num_pins = self.fitness_calculator.canvas_manager.num_pins
         for shift in random.sample([-3, -2, -1, 1, 2, 3], 6):
@@ -729,34 +1192,108 @@ class IslandThread(threading.Thread):
                 break
         return c
 
+    def _prune_excess_mutation(self, c: List[int], s: int, e: int) -> List[int]:
+        """Уменьшает длину хромосомы на 1 нить (удаляет избыточный гвоздь при допустимом стыке A->C)."""
+        if len(c) <= 2:
+            return [] if len(c) <= 2 else c
+        num_pins = self.fitness_calculator.canvas_manager.num_pins
+        # Иногда удаляем крайнюю хорду в хвосте
+        if random.random() < 0.25:
+            c.pop()
+            return c
+        rng = self._safe_interior_range(c, s, e)
+        if rng is None:
+            c.pop()
+            return c
+        for _ in range(8):
+            idx = random.randint(rng[0], rng[1])
+            if self._pin_dist(c[idx - 1], c[idx + 1], num_pins) >= self.min_pin_dist:
+                del c[idx]
+                return c
+        c.pop()
+        return c
+
+    def _insert_thread_mutation(self, c: List[int], s: int, e: int) -> List[int]:
+        """Увеличивает длину хромосомы на 1 нить (вставка A->X->C или достройка хвоста), строго <= max_lines."""
+        if len(c) - 1 >= self.max_lines or self.max_lines <= 0:
+            return self._smart_hinge_mutation(c, s, e)
+        num_pins = self.fitness_calculator.canvas_manager.num_pins
+        if len(c) < 2:
+            a = random.randint(0, num_pins - 1)
+            b = (a + max(self.min_pin_dist, num_pins // 3)) % num_pins
+            return [a, b]
+
+        # В 30% случаев достраиваем новый шаг в хвосте пути
+        if random.random() < 0.30:
+            last_p = c[-1]
+            cands = (
+                self.radon_guide.top_neighbors_cache[last_p]
+                if (self.radon_guide and self.radon_guide.top_neighbors_cache)
+                else np.empty(0, dtype=np.int32)
+            )
+            if len(cands) > 0:
+                cand = int(cands[random.randint(0, min(11, len(cands) - 1))])
+                if self._pin_dist(last_p, cand, num_pins) >= self.min_pin_dist:
+                    c.append(cand)
+                    return c
+            for _ in range(8):
+                cand = random.randint(0, num_pins - 1)
+                if self._pin_dist(last_p, cand, num_pins) >= self.min_pin_dist:
+                    c.append(cand)
+                    return c
+            return c
+
+        # Разбиваем существующую хорду c[idx] -> c[idx+1] на c[idx] -> cand -> c[idx+1]
+        hi = min(len(c) - 2, max(0, e - 1))
+        lo = max(0, min(s, hi))
+        idx = random.randint(lo, hi)
+        a, b = c[idx], c[idx + 1]
+        if self.radon_guide and self.radon_guide.top_neighbors_cache:
+            cands = self.radon_guide.top_neighbors_cache[a]
+            for cand in cands[:12]:
+                cand_i = int(cand)
+                if self._pin_dist(cand_i, a, num_pins) >= self.min_pin_dist and self._pin_dist(cand_i, b, num_pins) >= self.min_pin_dist:
+                    c.insert(idx + 1, cand_i)
+                    return c
+        for _ in range(10):
+            cand = random.randint(0, num_pins - 1)
+            if self._pin_dist(cand, a, num_pins) >= self.min_pin_dist and self._pin_dist(cand, b, num_pins) >= self.min_pin_dist:
+                c.insert(idx + 1, cand)
+                return c
+        return c
+
     def _graph_splice_crossover(self, p1: List[int], p2: List[int], start: int, end: int) -> List[int]:
-        if len(p1) != len(p2) or end - start < 4:
+        """Кроссовер хромосом (включая переменную длину) с проверкой стыков min_pin_dist и лимита max_lines."""
+        n1, n2 = len(p1), len(p2)
+        if n1 < 4 or n2 < 4 or end - start < 4:
             return list(p1)
         num_pins = self.fitness_calculator.canvas_manager.num_pins
-        n = len(p1)
-        lo = max(1, start + 1)
-        hi = min(end - 1, n - 2)
+        n_min = min(n1, n2)
+        lo = max(1, min(start + 1, n_min - 3))
+        hi = min(end - 1, n_min - 2)
         if lo >= hi:
             return list(p1)
 
         for _ in range(8):
             cut = random.randint(lo, hi)
-            # Проверяем левый стык p1[cut - 1] -> p2[cut]
             if self._pin_dist(p1[cut - 1], p2[cut], num_pins) < self.min_pin_dist:
                 continue
-            # Подбираем допустимый правый стык cut2 (вплоть до end)
-            cut2 = min(end, n)
-            if cut2 < n and self._pin_dist(p2[cut2 - 1], p1[cut2], num_pins) < self.min_pin_dist:
-                if cut + 1 < cut2:
-                    alt_cut2 = random.randint(cut + 1, cut2 - 1)
-                    if self._pin_dist(p2[alt_cut2 - 1], p1[alt_cut2], num_pins) < self.min_pin_dist:
+            cut2_p1 = min(end, n1)
+            cut2_p2 = min(end, n2)
+            if cut >= cut2_p2:
+                continue
+            if cut2_p1 < n1 and self._pin_dist(p2[cut2_p2 - 1], p1[cut2_p1], num_pins) < self.min_pin_dist:
+                if cut + 1 < min(cut2_p1, cut2_p2):
+                    alt = random.randint(cut + 1, min(cut2_p1, cut2_p2) - 1)
+                    if self._pin_dist(p2[alt - 1], p1[alt], num_pins) < self.min_pin_dist:
                         continue
-                    cut2 = alt_cut2
+                    cut2_p1 = alt
+                    cut2_p2 = alt
                 else:
                     continue
-            child = list(p1)
-            child[cut:cut2] = p2[cut:cut2]
-            return child
+            child = p1[:cut] + p2[cut:cut2_p2] + p1[cut2_p1:]
+            if len(child) - 1 <= self.max_lines:
+                return child
 
         return list(p1)
 
@@ -764,8 +1301,9 @@ class IslandThread(threading.Thread):
         self, chromosome: List[int], start: int, end: int, depth: int
     ) -> Tuple[List[int], float]:
         """
-        Сверхбыстрая локальная полировка пути за счет O(L) дельта-буфера (scratch)
-        и оценки пары кандидатов (Radon + локальный сдвиг) на каждом шаге.
+        Сверхбыстрая локальная полировка переменной длины за счет O(L) дельта-буфера (scratch):
+        на каждом шаге оценивает замену гвоздя (Radon + локальный сдвиг), удаление лишней нити
+        и вставку недостающей нити (строго <= max_lines).
         """
         if len(chromosome) < 4 or end - start < 3:
             return list(chromosome), self.fitness_calculator.calculate_single_fitness(chromosome)
@@ -783,24 +1321,24 @@ class IslandThread(threading.Thread):
         optical_depth = cm.compute_optical_depth_1d(best_c, line_alpha)
         total_err = fc.calculate_total_error(optical_depth)
 
-        low_idx = max(1, start)
-        high_idx = min(len(best_c) - 2, end - 1)
-        if low_idx >= high_idx:
-            return best_c, 1.0 - (total_err / flat_size)
-
         scratch = np.zeros(len(target_dark), dtype=np.int8)
         has_radon = bool(self.radon_guide and self.radon_guide.top_neighbors_cache)
         shifts = (-4, -3, -2, -1, 1, 2, 3, 4)
 
-        for _ in range(depth):
-            if self.stop_event.is_set():
+        for step_i in range(depth):
+            if self.stop_event.is_set() or len(best_c) < 3:
                 break
-            idx = random.randint(low_idx, high_idx)
+            hi_idx = min(len(best_c) - 2, max(1, end - 1))
+            lo_idx = max(1, min(start, hi_idx))
+            if lo_idx > hi_idx:
+                break
+
+            idx = random.randint(lo_idx, hi_idx)
             prev_p = best_c[idx - 1]
             cur_p = best_c[idx]
             next_p = best_c[idx + 1]
 
-            # Формируем до 2 разных кандидатов (1 от Радона + 1 локальный сдвиг)
+            # Формируем до 2 разных кандидатов для замены (1 от Радона + 1 локальный сдвиг)
             cand_list: List[int] = []
             if has_radon:
                 cands = self.radon_guide.top_neighbors_cache[prev_p]
@@ -822,15 +1360,13 @@ class IslandThread(threading.Thread):
             ):
                 cand_list.append(c_jit)
 
-            if not cand_list:
-                continue
-
             rem1 = cm.get_line_pixel_indices(prev_p, cur_p)
             rem2 = cm.get_line_pixel_indices(cur_p, next_p)
 
             best_delta = -1e-7
-            best_move: Optional[Tuple[int, np.ndarray, np.ndarray]] = None
+            best_move: Optional[Tuple[str, int, Optional[int], np.ndarray, np.ndarray]] = None
 
+            # 1) Замена гвоздя A->B->C -> A->X->C
             for cand_p in cand_list:
                 add1 = cm.get_line_pixel_indices(prev_p, cand_p)
                 add2 = cm.get_line_pixel_indices(cand_p, next_p)
@@ -848,13 +1384,67 @@ class IslandThread(threading.Thread):
                 )
                 if delta_err < best_delta and af is not None and nd is not None:
                     best_delta = delta_err
-                    best_move = (cand_p, af, nd)
+                    best_move = ("replace", idx, cand_p, af, nd)
+
+            # 2) Проверка удаления избыточной нити A->B->C -> A->C
+            if len(best_c) > 2 and self._pin_dist(prev_p, next_p, num_pins) >= self.min_pin_dist:
+                bridge = cm.get_line_pixel_indices(prev_p, next_p)
+                d_rem, af_r, nd_r = compute_delta_remove_pin_np(
+                    optical_depth,
+                    target_dark,
+                    importance,
+                    rem1,
+                    rem2,
+                    bridge,
+                    line_alpha,
+                    fearless,
+                    scratch=scratch,
+                )
+                if d_rem < best_delta and af_r is not None and nd_r is not None:
+                    best_delta = d_rem
+                    best_move = ("remove", idx, None, af_r, nd_r)
+
+            # 3) Проверка вставки недостающей нити A->B -> A->X->B (строго <= max_lines)
+            if (step_i & 1) == 0 and (len(best_c) - 1) < self.max_lines:
+                ins_cand: Optional[int] = None
+                if has_radon:
+                    cands_i = self.radon_guide.top_neighbors_cache[prev_p]
+                    if len(cands_i) > 0:
+                        ci = int(cands_i[random.randint(0, min(11, len(cands_i) - 1))])
+                        if self._pin_dist(ci, prev_p, num_pins) >= self.min_pin_dist and self._pin_dist(ci, cur_p, num_pins) >= self.min_pin_dist:
+                            ins_cand = ci
+                if ins_cand is None:
+                    ci = random.randint(0, num_pins - 1)
+                    if self._pin_dist(ci, prev_p, num_pins) >= self.min_pin_dist and self._pin_dist(ci, cur_p, num_pins) >= self.min_pin_dist:
+                        ins_cand = ci
+                if ins_cand is not None:
+                    add_i1 = cm.get_line_pixel_indices(prev_p, ins_cand)
+                    add_i2 = cm.get_line_pixel_indices(ins_cand, cur_p)
+                    d_ins, af_i, nd_i = compute_delta_insert_pin_np(
+                        optical_depth,
+                        target_dark,
+                        importance,
+                        rem1,
+                        add_i1,
+                        add_i2,
+                        line_alpha,
+                        fearless,
+                        scratch=scratch,
+                    )
+                    if d_ins < best_delta and af_i is not None and nd_i is not None:
+                        best_delta = d_ins
+                        best_move = ("insert", idx, ins_cand, af_i, nd_i)
 
             if best_move is not None:
-                cand_p, af, nd = best_move
+                op, pos, val, af, nd = best_move
                 optical_depth[af] = nd
                 total_err += best_delta
-                best_c[idx] = cand_p
+                if op == "replace" and val is not None:
+                    best_c[pos] = val
+                elif op == "remove":
+                    del best_c[pos]
+                elif op == "insert" and val is not None:
+                    best_c.insert(pos, val)
 
         return best_c, 1.0 - (total_err / flat_size)
 
@@ -865,7 +1455,7 @@ class IslandThread(threading.Thread):
             pop_size = max(4, self.config.get("population_size", 24))
             self.population = [{"chromosome": list(self.base_chromosome), "fitness": init_fit} for _ in range(pop_size)]
 
-            if self.island_id > 0:
+            if self.island_id > 0 and len(self.base_chromosome) >= 3:
                 mutated = [
                     self._smart_hinge_mutation(list(self.base_chromosome), 1, len(self.base_chromosome) - 1)
                     for _ in range(1, pop_size)
@@ -877,15 +1467,15 @@ class IslandThread(threading.Thread):
 
             self._send_island_update()
 
-            actual_lines = max(2, len(self.base_chromosome) - 1)
             stages = self.stages_override if self.stages_override is not None else max(1, self.config.get("stages", 5))
-            lines_per_stage = max(1, actual_lines // stages)
 
             for stage in range(stages):
                 if self.stop_event.is_set():
                     break
+                cur_lines = max(2, len(self.best_on_island["chromosome"]) - 1)
+                lines_per_stage = max(1, cur_lines // stages)
                 start_line = stage * lines_per_stage
-                end_line = actual_lines if stage == stages - 1 else min((stage + 1) * lines_per_stage, actual_lines)
+                end_line = cur_lines if stage == stages - 1 else min((stage + 1) * lines_per_stage, cur_lines)
                 patience = 0
                 patience_limit = max(6, int(round((PATIENCE_BASE + stage * PATIENCE_STAGE_FACTOR) * self.patience_scale)))
                 last_best = self.best_on_island["fitness"]
@@ -1018,6 +1608,7 @@ class IslandManagerThread(threading.Thread):
         stages_override: Optional[int] = None,
         patience_scale: float = 1.0,
         run_id: int = 0,
+        max_lines: Optional[int] = None,
     ):
         super().__init__(daemon=True, name=f"IslandManager-L{layer_idx}")
         self.config = config
@@ -1031,6 +1622,7 @@ class IslandManagerThread(threading.Thread):
         self.stages_override = stages_override
         self.patience_scale = patience_scale
         self.run_id = int(run_id)
+        self.max_lines = max(0, int(max_lines if max_lines is not None else config.get("lines", 1400)))
         self.islands: List[IslandThread] = []
         self.stop_event = threading.Event()
         self.status_queue = queues["status_queue"]
@@ -1052,10 +1644,17 @@ class IslandManagerThread(threading.Thread):
     def run(self) -> None:
         try:
             num_islands = max(1, self.config.get("num_islands", 3))
+            lang = normalize_lang(self.config.get("language", "ru"))
+            disp_layer = translate_layer_name(self.layer_name, lang)
+            st_msg = (
+                f"Stage 2: Evolutionary polishing ({disp_layer}, max {self.max_lines}) on {num_islands} islands..."
+                if lang == "en"
+                else f"Этап 2: Эволюционная полировка ({disp_layer}, макс. {self.max_lines}) на {num_islands} островах..."
+            )
             self.status_queue.put({
                 "type": "status",
                 "run_id": self.run_id,
-                "data": f"Этап 2: Эволюционная полировка ({self.layer_name}) на {num_islands} островах...",
+                "data": st_msg,
             })
             self.islands = [
                 IslandThread(
@@ -1069,6 +1668,7 @@ class IslandManagerThread(threading.Thread):
                     patience_scale=self.patience_scale,
                     layer_idx=self.layer_idx,
                     run_id=self.run_id,
+                    max_lines=self.max_lines,
                 )
                 for i in range(num_islands)
             ]
@@ -1094,11 +1694,47 @@ class IslandManagerThread(threading.Thread):
 
             candidates = [isl.get_best_individual() for isl in self.islands if isl.get_best_individual() is not None]
             if candidates:
-                self.best_result = max(candidates, key=lambda x: x["fitness"])
+                best = max(candidates, key=lambda x: x["fitness"])
+                if not self.stop_event.is_set():
+                    opt_path, opt_fit, n_rem, n_add = optimize_thread_count_delta(
+                        best["chromosome"],
+                        self.fitness_calculator,
+                        self.max_lines,
+                        radon_guide=self.radon_guide,
+                        max_prune_passes=2,
+                        allow_add=True,
+                    )
+                    if opt_fit >= best["fitness"] - 1e-7:
+                        best = {"chromosome": opt_path, "fitness": opt_fit}
+                        if n_rem > 0 or n_add > 0:
+                            logging.info(
+                                f"Адаптация числа нитей ({self.layer_name}): -{n_rem} лишних, +{n_add} доб. -> {max(0, len(opt_path) - 1)} нитей"
+                            )
+                            self.status_queue.put({
+                                "type": "island_update",
+                                "run_id": self.run_id,
+                                "data": {
+                                    "id": 0,
+                                    "layer_idx": self.layer_idx,
+                                    "chromosome": list(opt_path),
+                                    "fitness": opt_fit,
+                                    "mut_stats": {},
+                                    "force_update": True,
+                                },
+                            })
+                self.best_result = best
 
             if self.emit_done:
-                msg = "Остановлено пользователем." if self.stop_event.is_set() else "Генерация и полировка успешно завершены!"
+                if lang == "en":
+                    msg = "Stopped by user." if self.stop_event.is_set() else "Generation and polishing complete!"
+                else:
+                    msg = "Остановлено пользователем." if self.stop_event.is_set() else "Генерация и полировка успешно завершены!"
                 self.status_queue.put({"type": "done", "run_id": self.run_id, "data": msg})
         except Exception:
             logging.error("Ошибка в IslandManagerThread", exc_info=True)
-            self.status_queue.put({"type": "error", "run_id": self.run_id, "data": "Ошибка в диспетчере островов."})
+            err_msg = (
+                "Error in island manager."
+                if normalize_lang(self.config.get("language", "ru")) == "en"
+                else "Ошибка в диспетчере островов."
+            )
+            self.status_queue.put({"type": "error", "run_id": self.run_id, "data": err_msg})

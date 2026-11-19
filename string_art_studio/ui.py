@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Графический интерфейс String Art Studio Pro (Clean Light Theme),
-интерактивный плеер, шторка сравнения и живая аналитика Matplotlib.
+Графический интерфейс String Art Studio Pro (Clean Light Theme, RU / EN),
+интерактивный плеер, шторка сравнения, живая аналитика Matplotlib и переключение языка.
 """
 
 import logging
@@ -11,7 +11,7 @@ import tempfile
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -27,8 +27,6 @@ from matplotlib.figure import Figure
 
 from . import (
     APP_TITLE,
-    CANVAS_SHAPES,
-    COLOR_MODES,
     PRESETS,
     TOOLTIPS,
 )
@@ -38,6 +36,26 @@ from .engine import (
     CUDA_DEVICE_NAME,
     GPU_ENABLED_FLAG,
     SCIPY_AVAILABLE,
+)
+from .i18n import (
+    LANGUAGE_LABELS,
+    get_display_color_modes,
+    get_display_metrics,
+    get_display_presets,
+    get_display_shapes,
+    get_tooltip,
+    normalize_lang,
+    save_language_preference,
+    to_canonical_color_mode,
+    to_canonical_metric,
+    to_canonical_preset,
+    to_canonical_shape,
+    to_display_color_mode,
+    to_display_metric,
+    to_display_preset,
+    to_display_shape,
+    tr,
+    translate_layer_name,
 )
 from .preprocessing import auto_recommend_parameters, prepare_target_image_bundle
 
@@ -72,6 +90,9 @@ class ToolTip:
         self.widget.bind("<Enter>", self.showtip, add="+")
         self.widget.bind("<Leave>", self.hidetip, add="+")
 
+    def set_text(self, text: str) -> None:
+        self.text = text
+
     def showtip(self, event=None) -> None:
         if self.tipwindow or not self.text:
             return
@@ -99,7 +120,7 @@ class ToolTip:
 
 
 class UIManager:
-    """Управляет виджетами, светлой темой, графиками Matplotlib и холстами предпросмотра."""
+    """Управляет виджетами, светлой темой, графиками Matplotlib, холстами и локализацией RU/EN."""
 
     def __init__(self, root: "StringArtApp", state: AppState):
         self.root = root
@@ -116,6 +137,22 @@ class UIManager:
         self.ax_mut: Optional[plt.Axes] = None
         self.chart_canvas: Optional[FigureCanvasTkAgg] = None
         self._slider_limits: Dict[str, Tuple[float, float, bool]] = {}
+        self._i18n_widgets: List[Tuple[tk.Widget, str, str]] = []
+        self._tooltips: List[Tuple[ToolTip, str]] = []
+        self._last_thread_length_m: Optional[float] = None
+        self._last_gpu_flag: bool = GPU_ENABLED_FLAG
+
+    def _t(self, key: str, **kwargs) -> str:
+        return tr(key, self.state.lang, **kwargs)
+
+    def _reg_text(self, widget: tk.Widget, key: str, suffix: str = "") -> None:
+        self._i18n_widgets.append((widget, key, suffix))
+
+    def _add_tip(self, widget: tk.Widget, tip_key: str) -> None:
+        if not tip_key:
+            return
+        tip = ToolTip(widget, get_tooltip(tip_key, self.state.lang, TOOLTIPS))
+        self._tooltips.append((tip, tip_key))
 
     def create_widgets(self) -> None:
         style = ttk.Style(self.root)
@@ -164,7 +201,8 @@ class UIManager:
         self._create_control_panel(top_area)
         self._create_display_area(top_area)
 
-        progress_frame = ttk.LabelFrame(main_pane, text="Дашборд Эволюции и Аналитика Алгоритма", height=220)
+        progress_frame = ttk.LabelFrame(main_pane, text=self._t("dashboard_frame"), height=220)
+        self._reg_text(progress_frame, "dashboard_frame")
         main_pane.add(progress_frame, weight=1)
         self._create_stats_and_chart_area(progress_frame)
 
@@ -215,7 +253,8 @@ class UIManager:
         display_area = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
         parent.add(display_area, weight=1)
 
-        target_frame = ttk.LabelFrame(display_area, text="Целевой шаблон (с живой предобработкой)", width=340)
+        target_frame = ttk.LabelFrame(display_area, text=self._t("target_frame"), width=340)
+        self._reg_text(target_frame, "target_frame")
         display_area.add(target_frame, weight=0)
         canvas = tk.Canvas(target_frame, bg="#ffffff", relief="sunken", borderwidth=1)
         canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -242,55 +281,79 @@ class UIManager:
         elif 1 <= idx <= int(self.state.safe_get("num_islands")):
             self.on_result_canvas_resize(None, idx - 1)
 
-    def _create_section(self, parent: tk.Widget, title: str) -> ttk.LabelFrame:
-        frame = ttk.LabelFrame(parent, text=title, padding=6)
+    def _create_section(self, parent: tk.Widget, title_key: str) -> ttk.LabelFrame:
+        frame = ttk.LabelFrame(parent, text=self._t(title_key), padding=6)
+        self._reg_text(frame, title_key)
         frame.pack(fill=tk.X, pady=3, padx=3, anchor="n")
         return frame
 
     def _create_image_settings_section(self, parent: tk.Widget) -> None:
-        frame = self._create_section(parent, "1. Изображение, Проекты и Пресеты")
-        btn = ttk.Button(frame, text="📁 Загрузить изображение (Ctrl+O)")
+        frame = self._create_section(parent, "sec_image")
+
+        # Переключатель языка (RU / EN)
+        f_lang = ttk.Frame(frame)
+        f_lang.pack(fill=tk.X, pady=(0, 2))
+        lbl_lang = ttk.Label(f_lang, text=self._t("lbl_language"), width=11)
+        lbl_lang.pack(side=tk.LEFT)
+        self._reg_text(lbl_lang, "lbl_language")
+        lang_cb = ttk.Combobox(
+            f_lang,
+            textvariable=self.state.vars["language"],
+            values=[LANGUAGE_LABELS["ru"], LANGUAGE_LABELS["en"]],
+            state="readonly",
+        )
+        lang_cb.pack(fill=tk.X, expand=True)
+        lang_cb.bind("<<ComboboxSelected>>", self._on_language_selected)
+        self._add_tip(lang_cb, "language")
+        self.widgets["language_combo"] = lang_cb
+
+        btn = ttk.Button(frame, text=self._t("btn_load_image"))
         btn.pack(fill=tk.X, pady=2)
-        ToolTip(btn, TOOLTIPS["load_image"])
+        self._reg_text(btn, "btn_load_image")
+        self._add_tip(btn, "load_image")
         self.widgets["load_image_button"] = btn
 
         proj_row = ttk.Frame(frame)
         proj_row.pack(fill=tk.X, pady=1)
         btn_save_proj = ttk.Button(
             proj_row,
-            text="💾 Сохранить",
+            text=self._t("btn_save_project"),
             command=self.coordinator.save_project,
             state=tk.DISABLED,
         )
         btn_load_proj = ttk.Button(
             proj_row,
-            text="📂 Открыть проект",
+            text=self._t("btn_load_project"),
             command=self.coordinator.load_project,
         )
         btn_save_proj.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 1))
         btn_load_proj.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(1, 0))
-        ToolTip(btn_save_proj, TOOLTIPS["save_project"])
-        ToolTip(btn_load_proj, TOOLTIPS["load_project"])
+        self._reg_text(btn_save_proj, "btn_save_project")
+        self._reg_text(btn_load_proj, "btn_load_project")
+        self._add_tip(btn_save_proj, "save_project")
+        self._add_tip(btn_load_proj, "load_project")
         self.widgets["save_project_button"] = btn_save_proj
         self.widgets["load_project_button"] = btn_load_proj
 
         f_pre = ttk.Frame(frame)
         f_pre.pack(fill=tk.X, pady=2)
-        ttk.Label(f_pre, text="Пресет:", width=9).pack(side=tk.LEFT)
+        lbl_pre = ttk.Label(f_pre, text=self._t("lbl_preset"), width=9)
+        lbl_pre.pack(side=tk.LEFT)
+        self._reg_text(lbl_pre, "lbl_preset")
         preset_cb = ttk.Combobox(
             f_pre,
             textvariable=self.state.vars["preset"],
-            values=list(PRESETS.keys()),
+            values=get_display_presets(self.state.lang),
             state="readonly",
         )
         preset_cb.pack(fill=tk.X, expand=True)
         preset_cb.bind("<<ComboboxSelected>>", self.root.on_preset_selected)
-        ToolTip(preset_cb, TOOLTIPS["preset"])
+        self._add_tip(preset_cb, "preset")
         self.widgets["preset_combo"] = preset_cb
 
         lbl_info = ttk.Label(
             frame,
-            text="Анализ: загрузите фото...",
+            text=self._t("analysis_prompt"),
             font=("Segoe UI", 8),
             foreground="#333333",
             wraplength=245,
@@ -300,227 +363,248 @@ class UIManager:
 
         btn_auto = ttk.Button(
             frame,
-            text="🔮 Авто-подбор (без каши)",
+            text=self._t("btn_auto"),
             command=self.root.apply_auto_recommendations,
         )
         btn_auto.pack(fill=tk.X, pady=2)
+        self._reg_text(btn_auto, "btn_auto")
 
-        self._create_double_slider_row(frame, "gamma", "Светлота (Гамма)", (0.50, 1.40), command=self.root.redraw_target_canvas)
-        self._create_double_slider_row(frame, "clahe_clip", "Контраст (CLAHE)", (0.0, 3.5), command=self.root.redraw_target_canvas)
+        self._create_double_slider_row(frame, "gamma", "sl_gamma", (0.50, 1.40), command=self.root.redraw_target_canvas)
+        self._create_double_slider_row(frame, "clahe_clip", "sl_clahe_clip", (0.0, 3.5), command=self.root.redraw_target_canvas)
         self.widgets["image_settings_frame"] = frame
 
     def _create_geometry_section(self, parent: tk.Widget) -> None:
-        frame = self._create_section(parent, "2. Геометрия, Цвет и Нить")
+        frame = self._create_section(parent, "sec_geometry")
         f_shape = ttk.Frame(frame)
         f_shape.pack(fill=tk.X, pady=2)
-        ttk.Label(f_shape, text="Форма холста:", width=15).pack(side=tk.LEFT)
+        lbl_sh = ttk.Label(f_shape, text=self._t("lbl_canvas_shape"), width=15)
+        lbl_sh.pack(side=tk.LEFT)
+        self._reg_text(lbl_sh, "lbl_canvas_shape")
         shape_combo = ttk.Combobox(
             f_shape,
             textvariable=self.state.vars["canvas_shape"],
-            values=CANVAS_SHAPES,
+            values=get_display_shapes(self.state.lang),
             state="readonly",
         )
         shape_combo.pack(fill=tk.X, expand=True)
         shape_combo.bind("<<ComboboxSelected>>", self.root.redraw_target_canvas)
-        ToolTip(shape_combo, TOOLTIPS["canvas_shape"])
+        self._add_tip(shape_combo, "canvas_shape")
+        self.widgets["shape_combo"] = shape_combo
 
         f_color = ttk.Frame(frame)
         f_color.pack(fill=tk.X, pady=2)
-        ttk.Label(f_color, text="Режим цвета:", width=15).pack(side=tk.LEFT)
+        lbl_col = ttk.Label(f_color, text=self._t("lbl_color_mode"), width=15)
+        lbl_col.pack(side=tk.LEFT)
+        self._reg_text(lbl_col, "lbl_color_mode")
         color_combo = ttk.Combobox(
             f_color,
             textvariable=self.state.vars["color_mode"],
-            values=COLOR_MODES,
+            values=get_display_color_modes(self.state.lang),
             state="readonly",
         )
         color_combo.pack(fill=tk.X, expand=True)
         color_combo.bind("<<ComboboxSelected>>", self.root.redraw_target_canvas)
-        ToolTip(color_combo, TOOLTIPS["color_mode"])
+        self._add_tip(color_combo, "color_mode")
+        self.widgets["color_combo"] = color_combo
 
-        self._create_slider_row(frame, "pins", "Гвозди", (120, 480))
-        self._create_double_slider_row(frame, "physical_diameter", "Размер (см)", (20.0, 120.0))
-        self._create_slider_row(frame, "lines", "Макс. нитей", (400, 4500))
-        self._create_slider_row(frame, "line_weight", "Плотность нити (%)", (40, 95), command=self._on_visual_param_change)
-        self._create_slider_row(frame, "thread_thickness", "Толщина нити", (1, 3), command=self._on_visual_param_change)
-        self._create_slider_row(frame, "fearless_factor", "Защита фона (%)", (70, 100))
+        self._create_slider_row(frame, "pins", "sl_pins", (120, 480))
+        self._create_double_slider_row(frame, "physical_diameter", "sl_physical_diameter", (20.0, 120.0))
+        self._create_slider_row(frame, "lines", "sl_lines", (400, 4500))
+        self._create_slider_row(frame, "line_weight", "sl_line_weight", (40, 95), command=self._on_visual_param_change)
+        self._create_slider_row(frame, "thread_thickness", "sl_thread_thickness", (1, 3), command=self._on_visual_param_change)
+        self._create_slider_row(frame, "fearless_factor", "sl_fearless_factor", (70, 100))
         self.widgets["geometry_frame"] = frame
 
     def _create_algorithm_section(self, parent: tk.Widget) -> None:
-        frame = self._create_section(parent, "3. Островной ГА (Полировка)")
+        frame = self._create_section(parent, "sec_algo")
         sliders = [
-            ("num_islands", "Острова (потоки)", (1, max(2, os.cpu_count() or 4))),
-            ("population_size", "Популяция", (8, 80)),
-            ("stages", "Этапы доводки", (2, 12)),
-            ("mutation_rate", "Мутация (%)", (5, 70)),
-            ("migration_interval", "Миграция (пок.)", (5, 50)),
+            ("num_islands", "sl_num_islands", (1, max(2, os.cpu_count() or 4))),
+            ("population_size", "sl_population_size", (8, 80)),
+            ("stages", "sl_stages", (2, 12)),
+            ("mutation_rate", "sl_mutation_rate", (5, 70)),
+            ("migration_interval", "sl_migration_interval", (5, 50)),
         ]
-        for name, text, limits in sliders:
-            self._create_slider_row(frame, name, text, limits)
+        for name, text_key, limits in sliders:
+            self._create_slider_row(frame, name, text_key, limits)
         self.widgets["algo_frame"] = frame
 
     def _create_fitness_and_radon_section(self, parent: tk.Widget) -> None:
-        frame = self._create_section(parent, "4. Радон FBP и Дельта-Поиск")
+        frame = self._create_section(parent, "sec_fitness")
         f_struct = ttk.Frame(frame)
         f_struct.pack(fill=tk.X, pady=2)
-        ttk.Label(f_struct, text="Метрика краев:", width=15).pack(side=tk.LEFT)
-        struct_values = ["Контуры"]
-        if SCIPY_AVAILABLE:
-            struct_values.insert(0, "Преобразование расстояний")
+        lbl_st = ttk.Label(f_struct, text=self._t("lbl_struct_metric"), width=15)
+        lbl_st.pack(side=tk.LEFT)
+        self._reg_text(lbl_st, "lbl_struct_metric")
         struct_combo = ttk.Combobox(
             f_struct,
             textvariable=self.state.vars["structural_metric"],
-            values=struct_values,
+            values=get_display_metrics(self.state.lang, SCIPY_AVAILABLE),
             state="readonly",
         )
         struct_combo.pack(fill=tk.X, expand=True)
-        ToolTip(struct_combo, TOOLTIPS["structural_metric"])
-        self._create_slider_row(frame, "contour_weight", "Вес контуров (%)", (10, 90))
+        self._add_tip(struct_combo, "structural_metric")
+        self.widgets["struct_combo"] = struct_combo
+        self._create_slider_row(frame, "contour_weight", "sl_contour_weight", (10, 90))
 
         ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=4)
         check_mem = ttk.Checkbutton(
             frame,
-            text="Включить быстрый дельта-поиск",
+            text=self._t("chk_memetic"),
             variable=self.state.vars["memetic_enabled"],
         )
         check_mem.pack(anchor="w")
-        ToolTip(check_mem, TOOLTIPS["memetic_enabled"])
-        self._create_slider_row(frame, "memetic_intensity", "Интенсивность (%)", (5, 50))
-        self._create_slider_row(frame, "memetic_depth", "Глубина поиска", (5, 80))
+        self._reg_text(check_mem, "chk_memetic")
+        self._add_tip(check_mem, "memetic_enabled")
+        self._create_slider_row(frame, "memetic_intensity", "sl_memetic_intensity", (5, 50))
+        self._create_slider_row(frame, "memetic_depth", "sl_memetic_depth", (5, 80))
 
         ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=4)
         check_radon = ttk.Checkbutton(
             frame,
-            text="Наведение Радона (Ramp FBP)",
+            text=self._t("chk_radon"),
             variable=self.state.vars["radon_enabled"],
         )
         check_radon.pack(anchor="w")
-        ToolTip(check_radon, TOOLTIPS["radon_enabled"])
-        self._create_slider_row(frame, "radon_influence", "Сила Радона (%)", (0, 100))
+        self._reg_text(check_radon, "chk_radon")
+        self._add_tip(check_radon, "radon_enabled")
+        self._create_slider_row(frame, "radon_influence", "sl_radon_influence", (0, 100))
         self.widgets["fitness_frame"] = frame
 
     def _create_inspector_section(self, parent: tk.Widget) -> None:
-        frame = self._create_section(parent, "5. Интерактивный Плеер и Инспектор")
+        frame = self._create_section(parent, "sec_inspector")
 
         f_lay = ttk.Frame(frame)
         f_lay.pack(fill=tk.X, pady=2)
-        ttk.Label(f_lay, text="Активный слой:", width=15).pack(side=tk.LEFT)
+        lbl_lay = ttk.Label(f_lay, text=self._t("lbl_active_layer"), width=15)
+        lbl_lay.pack(side=tk.LEFT)
+        self._reg_text(lbl_lay, "lbl_active_layer")
         layer_cb = ttk.Combobox(
             f_lay,
             textvariable=self.state.vars["active_layer"],
-            values=["Черная нить"],
+            values=[translate_layer_name("Черная нить", self.state.lang)],
             state="readonly",
         )
         layer_cb.pack(fill=tk.X, expand=True)
         layer_cb.bind("<<ComboboxSelected>>", self._on_active_layer_changed)
-        ToolTip(layer_cb, TOOLTIPS["active_layer"])
+        self._add_tip(layer_cb, "active_layer")
         self.widgets["active_layer_combo"] = layer_cb
 
-        self._create_slider_row(frame, "step_scrubber", "Слой плетения", (1, 4500), command=self._on_scrubber_slider_move)
+        self._create_slider_row(frame, "step_scrubber", "sl_step_scrubber", (1, 4500), command=self._on_scrubber_slider_move)
 
         f_step = ttk.Frame(frame)
         f_step.pack(fill=tk.X, pady=2)
         self.widgets["player_step_label"] = ttk.Label(
-            f_step, text="Ход: --", font=("Segoe UI", 8, "bold"), foreground="#0969da"
+            f_step, text=self._t("player_idle"), font=("Segoe UI", 8, "bold"), foreground="#0969da"
         )
         self.widgets["player_step_label"].pack(side=tk.LEFT)
 
         nav = ttk.Frame(frame)
         nav.pack(fill=tk.X, pady=2)
-        btn_prev = ttk.Button(nav, text="◀ Назад", command=lambda: self.root.step_player(-1))
-        btn_auto = ttk.Button(nav, text="▶ Авто", command=self.root.toggle_auto_play)
-        btn_next = ttk.Button(nav, text="Вперед ▶", command=lambda: self.root.step_player(1))
+        btn_prev = ttk.Button(nav, text=self._t("btn_prev"), command=lambda: self.root.step_player(-1))
+        btn_auto = ttk.Button(nav, text=self._t("btn_auto_play"), command=self.root.toggle_auto_play)
+        btn_next = ttk.Button(nav, text=self._t("btn_next"), command=lambda: self.root.step_player(1))
         btn_prev.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
         btn_auto.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
         btn_next.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+        self._reg_text(btn_prev, "btn_prev")
+        self._reg_text(btn_next, "btn_next")
         self.widgets["auto_play_button"] = btn_auto
 
         opts = ttk.Frame(frame)
         opts.pack(fill=tk.X, pady=2)
         chk_neon = ttk.Checkbutton(
             opts,
-            text="✨ Подсветка нити",
+            text=self._t("chk_neon"),
             variable=self.state.vars["show_active_chord"],
             command=self._on_visual_param_change,
         )
         chk_neon.pack(side=tk.LEFT)
-        ToolTip(chk_neon, TOOLTIPS["show_active_chord"])
+        self._reg_text(chk_neon, "chk_neon")
+        self._add_tip(chk_neon, "show_active_chord")
 
         chk_voice = ttk.Checkbutton(
             opts,
-            text="🔊 Голос (SAPI)",
+            text=self._t("chk_voice"),
             variable=self.state.vars["voice_enabled"],
             command=self.root.on_voice_toggle,
         )
         if not SAPI_AVAILABLE:
             chk_voice.config(state=tk.DISABLED)
         chk_voice.pack(side=tk.RIGHT)
-        ToolTip(chk_voice, TOOLTIPS["voice_enabled"])
+        self._reg_text(chk_voice, "chk_voice")
+        self._add_tip(chk_voice, "voice_enabled")
 
-        self._create_slider_row(frame, "split_compare", "Шторка До/После %", (0, 100), command=self._on_visual_param_change)
+        self._create_slider_row(frame, "split_compare", "sl_split_compare", (0, 100), command=self._on_visual_param_change)
         self.widgets["inspector_frame"] = frame
 
     def _create_control_and_export_section(self, parent: tk.Widget) -> None:
-        frame = self._create_section(parent, "6. Управление и Экспорт")
+        frame = self._create_section(parent, "sec_control")
         btn_start = ttk.Button(
             frame,
-            text="▶ Старт (CSR OMP + Острова)",
+            text=self._t("btn_start"),
             style="Primary.TButton",
             command=self.coordinator.start_generation,
         )
         btn_start.pack(fill=tk.X, pady=2)
-        ToolTip(btn_start, TOOLTIPS["start"])
+        self._reg_text(btn_start, "btn_start")
+        self._add_tip(btn_start, "start")
         self.widgets["start_button"] = btn_start
 
         btn_row = ttk.Frame(frame)
         btn_row.pack(fill=tk.X, pady=2)
-        for name, text, command, state in [
-            ("polish", "✨ Доводка", self.coordinator.start_evolution_only, tk.NORMAL),
-            ("pause", "❚❚ Пауза", self.coordinator.toggle_pause, tk.DISABLED),
-            ("stop", "■ Стоп", self.coordinator.stop_generation, tk.DISABLED),
+        for name, text_key, command, state in [
+            ("polish", "btn_polish", self.coordinator.start_evolution_only, tk.NORMAL),
+            ("pause", "btn_pause", self.coordinator.toggle_pause, tk.DISABLED),
+            ("stop", "btn_stop", self.coordinator.stop_generation, tk.DISABLED),
         ]:
-            btn = ttk.Button(btn_row, text=text, command=command, state=state)
+            btn = ttk.Button(btn_row, text=self._t(text_key), command=command, state=state)
             btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
-            ToolTip(btn, TOOLTIPS.get(name, ""))
+            if name != "pause":
+                self._reg_text(btn, text_key)
+            self._add_tip(btn, name)
             self.widgets[f"{name}_button"] = btn
 
         ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=4)
 
         btn_prune = ttk.Button(
             frame,
-            text="✂ Оптимизировать путь (убрать петли)",
+            text=self._t("btn_prune"),
             command=self.coordinator.prune_chromosome,
             state=tk.DISABLED,
         )
         btn_prune.pack(fill=tk.X, pady=1)
-        ToolTip(btn_prune, TOOLTIPS["prune"])
+        self._reg_text(btn_prune, "btn_prune")
+        self._add_tip(btn_prune, "prune")
         self.widgets["prune_button"] = btn_prune
 
         btn_html = ttk.Button(
             frame,
-            text="🌐 Автономный веб-ассистент (.html)",
+            text=self._t("btn_export_html"),
             command=self.coordinator.export_html,
             state=tk.DISABLED,
         )
         btn_html.pack(fill=tk.X, pady=2)
-        ToolTip(btn_html, TOOLTIPS["export_html"])
+        self._reg_text(btn_html, "btn_export_html")
+        self._add_tip(btn_html, "export_html")
         self.widgets["export_html_button"] = btn_html
 
         grid = ttk.Frame(frame)
         grid.pack(fill=tk.X, pady=1)
         export_pairs = [
-            ("export_txt", "📄 Схема (.txt)", self.coordinator.export_txt, 0, 0),
-            ("export_csv", "📊 Таблица (.csv)", self.coordinator.export_csv, 0, 1),
-            ("export_png", "🖼 Ultra HD (.png)", self.coordinator.export_png, 1, 0),
-            ("export_svg", "📐 Вектор (.svg)", self.coordinator.export_svg, 1, 1),
-            ("export_template", "⭕ Шаблон 1:1 (.svg)", self.coordinator.export_template, 2, 0),
-            ("export_gcode", "⚙ ЧПУ (.gcode)", self.coordinator.export_gcode, 2, 1),
+            ("export_txt", "btn_export_txt", self.coordinator.export_txt, 0, 0),
+            ("export_csv", "btn_export_csv", self.coordinator.export_csv, 0, 1),
+            ("export_png", "btn_export_png", self.coordinator.export_png, 1, 0),
+            ("export_svg", "btn_export_svg", self.coordinator.export_svg, 1, 1),
+            ("export_template", "btn_export_template", self.coordinator.export_template, 2, 0),
+            ("export_gcode", "btn_export_gcode", self.coordinator.export_gcode, 2, 1),
         ]
         grid.columnconfigure(0, weight=1)
         grid.columnconfigure(1, weight=1)
-        for name, text, cmd, r, c in export_pairs:
-            btn = ttk.Button(grid, text=text, command=cmd, state=tk.DISABLED)
+        for name, text_key, cmd, r, c in export_pairs:
+            btn = ttk.Button(grid, text=self._t(text_key), command=cmd, state=tk.DISABLED)
             btn.grid(row=r, column=c, sticky="ew", padx=1, pady=1)
-            ToolTip(btn, TOOLTIPS.get(name, ""))
+            self._reg_text(btn, text_key)
+            self._add_tip(btn, name)
             self.widgets[f"{name}_button"] = btn
 
     def _create_stats_and_chart_area(self, parent: tk.Widget) -> None:
@@ -531,26 +615,26 @@ class UIManager:
         left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=2)
 
         self.widgets["status_label"] = ttk.Label(
-            left_panel, text="Ожидание запуска...", font=("Segoe UI", 9, "bold"), wraplength=280
+            left_panel, text=self._t("status_waiting"), font=("Segoe UI", 9, "bold"), wraplength=280
         )
         self.widgets["status_label"].pack(anchor="w")
-        self.widgets["fitness_label"] = ttk.Label(left_panel, text="Точность (Фитнес): --", foreground="#0969da")
+        self.widgets["fitness_label"] = ttk.Label(left_panel, text=self._t("fitness_idle"), foreground="#0969da")
         self.widgets["fitness_label"].pack(anchor="w", pady=(0, 2))
 
         mode_str = f"PyTorch CUDA ({CUDA_DEVICE_NAME}) + CSR" if GPU_ENABLED_FLAG else "SciPy CSR + NumPy (CPU)"
         self.widgets["compute_mode_label"] = ttk.Label(
-            left_panel, text=f"Ядро: {mode_str}", font=("Segoe UI", 8), foreground="#57606a"
+            left_panel, text=self._t("engine_label", mode=mode_str), font=("Segoe UI", 8), foreground="#57606a"
         )
         self.widgets["compute_mode_label"].pack(anchor="w", pady=(0, 4))
 
-        for key, text in [
-            ("time", "Время:"),
-            ("eta", "Осталось (ETA):"),
-            ("gens", "Поколений:"),
-            ("mig", "Миграций:"),
-            ("len", "Длина нити:"),
+        for key, text_key in [
+            ("time", "stat_time"),
+            ("eta", "stat_eta"),
+            ("gens", "stat_gens"),
+            ("mig", "stat_mig"),
+            ("len", "stat_len"),
         ]:
-            self.widgets[key + "_label"] = self._create_stat_row(left_panel, text)
+            self.widgets[key + "_label"] = self._create_stat_row(left_panel, text_key)
 
         self.widgets["main_progress_bars_frame"] = ttk.Frame(left_panel)
         self.widgets["main_progress_bars_frame"].pack(fill=tk.BOTH, expand=True, pady=3)
@@ -566,15 +650,16 @@ class UIManager:
         self,
         parent: tk.Widget,
         name: str,
-        text: str,
+        text_key: str,
         limits: Tuple[int, int],
         command: Optional[Callable] = None,
     ) -> None:
         self._slider_limits[name] = (float(limits[0]), float(limits[1]), True)
         f = ttk.Frame(parent)
         f.pack(fill=tk.X, pady=1)
-        lbl = ttk.Label(f, text=f"{text}:", width=15)
+        lbl = ttk.Label(f, text=f"{self._t(text_key)}:", width=15)
         lbl.pack(side=tk.LEFT)
+        self._reg_text(lbl, text_key, suffix=":")
         entry = ttk.Entry(f, textvariable=self.state.vars[name], width=6)
         entry.pack(side=tk.RIGHT)
         var = self.state.vars[name]
@@ -600,24 +685,24 @@ class UIManager:
         scale = ttk.Scale(f, from_=limits[0], to=limits[1], variable=var, orient=tk.HORIZONTAL, command=cmd)
         scale.pack(fill=tk.X, expand=True, padx=4)
         self.widgets[f"{name}_scale"] = scale
-        tip = TOOLTIPS.get(name, "")
-        ToolTip(lbl, tip)
-        ToolTip(entry, tip)
-        ToolTip(scale, tip)
+        self._add_tip(lbl, name)
+        self._add_tip(entry, name)
+        self._add_tip(scale, name)
 
     def _create_double_slider_row(
         self,
         parent: tk.Widget,
         name: str,
-        text: str,
+        text_key: str,
         limits: Tuple[float, float],
         command: Optional[Callable] = None,
     ) -> None:
         self._slider_limits[name] = (float(limits[0]), float(limits[1]), False)
         f = ttk.Frame(parent)
         f.pack(fill=tk.X, pady=1)
-        lbl = ttk.Label(f, text=f"{text}:", width=15)
+        lbl = ttk.Label(f, text=f"{self._t(text_key)}:", width=15)
         lbl.pack(side=tk.LEFT)
+        self._reg_text(lbl, text_key, suffix=":")
         entry = ttk.Entry(f, textvariable=self.state.vars[name], width=6)
         entry.pack(side=tk.RIGHT)
         var = self.state.vars[name]
@@ -643,51 +728,160 @@ class UIManager:
         scale = ttk.Scale(f, from_=limits[0], to=limits[1], variable=var, orient=tk.HORIZONTAL, command=cmd)
         scale.pack(fill=tk.X, expand=True, padx=4)
         self.widgets[f"{name}_scale"] = scale
-        tip = TOOLTIPS.get(name, "")
-        ToolTip(lbl, tip)
-        ToolTip(entry, tip)
-        ToolTip(scale, tip)
+        self._add_tip(lbl, name)
+        self._add_tip(entry, name)
+        self._add_tip(scale, name)
 
-    def _create_stat_row(self, parent: tk.Widget, text: str) -> ttk.Label:
+    def _create_stat_row(self, parent: tk.Widget, text_key: str) -> ttk.Label:
         row_frame = ttk.Frame(parent)
         row_frame.pack(fill="x")
-        ttk.Label(row_frame, text=text, font=("Segoe UI", 8, "bold"), width=15, anchor="w").pack(side=tk.LEFT)
+        lbl = ttk.Label(row_frame, text=self._t(text_key), font=("Segoe UI", 8, "bold"), width=15, anchor="w")
+        lbl.pack(side=tk.LEFT)
+        self._reg_text(lbl, text_key)
         value_label = ttk.Label(row_frame, text="--", font=("Segoe UI", 8), anchor="w")
         value_label.pack(side=tk.LEFT)
         return value_label
+
+    def _on_language_selected(self, _event=None) -> None:
+        sel = str(self.state.vars["language"].get())
+        lang = "ru" if sel == LANGUAGE_LABELS["ru"] or sel.lower().startswith("ру") else "en"
+        self.root.set_language(lang, persist=True)
+
+    def apply_language(self, lang: str) -> None:
+        """Мгновенно переводит весь интерфейс, подсказки, комбобоксы, вкладки и графики без перезапуска."""
+        code = normalize_lang(lang)
+        self.state.lang = code
+        self.state.vars["language"].set(LANGUAGE_LABELS[code])
+
+        # 1) Обновляем все зарегистрированные текстовые виджеты (Label, Button, LabelFrame, Checkbutton)
+        for widget, key, suffix in self._i18n_widgets:
+            try:
+                widget.configure(text=f"{tr(key, code)}{suffix}")
+            except tk.TclError:
+                pass
+
+        # 2) Обновляем все всплывающие подсказки ToolTip
+        for tip, tip_key in self._tooltips:
+            tip.set_text(get_tooltip(tip_key, code, TOOLTIPS))
+
+        # 3) Переводим списки и текущие значения всех Combobox (сохраняя каноническое значение)
+        if "preset_combo" in self.widgets:
+            canon_pre = to_canonical_preset(str(self.state.vars["preset"].get()))
+            self.widgets["preset_combo"].configure(values=get_display_presets(code))
+            self.state.vars["preset"].set(to_display_preset(canon_pre, code))
+
+        if "shape_combo" in self.widgets:
+            canon_sh = to_canonical_shape(str(self.state.vars["canvas_shape"].get()))
+            self.widgets["shape_combo"].configure(values=get_display_shapes(code))
+            self.state.vars["canvas_shape"].set(to_display_shape(canon_sh, code))
+
+        if "color_combo" in self.widgets:
+            canon_col = to_canonical_color_mode(str(self.state.vars["color_mode"].get()))
+            self.widgets["color_combo"].configure(values=get_display_color_modes(code))
+            self.state.vars["color_mode"].set(to_display_color_mode(canon_col, code))
+
+        if "struct_combo" in self.widgets:
+            canon_met = to_canonical_metric(str(self.state.vars["structural_metric"].get()))
+            self.widgets["struct_combo"].configure(values=get_display_metrics(code, SCIPY_AVAILABLE))
+            self.state.vars["structural_metric"].set(to_display_metric(canon_met, code))
+
+        # 4) Динамические кнопки и лейблы состояния
+        if "pause_button" in self.widgets:
+            self.widgets["pause_button"].config(
+                text=self._t("btn_resume" if self.state.is_paused else "btn_pause")
+            )
+        if "auto_play_button" in self.widgets:
+            self.widgets["auto_play_button"].config(
+                text=self._t("btn_auto_stop" if self.root._auto_play_job else "btn_auto_play")
+            )
+        if not self.state.is_running and not self.state.layers:
+            self.widgets["status_label"].config(text=self._t("status_waiting"))
+        if self.state.overall_best_fitness > 0:
+            self.update_best_fitness_display(self.state.overall_best_fitness)
+        else:
+            self.widgets["fitness_label"].config(text=self._t("fitness_idle"))
+
+        mode_str = f"PyTorch CUDA ({CUDA_DEVICE_NAME}) + CSR" if self._last_gpu_flag else "SciPy CSR + NumPy (CPU)"
+        self.widgets["compute_mode_label"].config(text=self._t("engine_label", mode=mode_str))
+
+        if self._last_thread_length_m is not None:
+            self.update_thread_length_display(self._last_thread_length_m)
+
+        if self.state.original_image is None and "analysis_label" in self.widgets:
+            self.widgets["analysis_label"].config(text=self._t("analysis_prompt"))
+
+        # 5) Вкладки Notebook и прогресс-бары островов
+        notebook = self.widgets.get("results_notebook")
+        if isinstance(notebook, ttk.Notebook):
+            tabs = notebook.tabs()
+            n_islands = max(0, len(tabs) - 5)
+            tab_titles = [self._t("tab_overall")]
+            tab_titles.extend(self._t("tab_island", i=i + 1) for i in range(n_islands))
+            tab_titles.extend([
+                self._t("tab_diff_map"),
+                self._t("tab_density"),
+                self._t("tab_saliency"),
+                self._t("tab_radon"),
+            ])
+            for tab_id, title in zip(tabs, tab_titles):
+                notebook.tab(tab_id, text=title)
+
+        for i, lbl in self.main_island_labels.items():
+            if not self.state.is_running:
+                lbl.config(text=self._t("island_done" if self.state.layers else "island_start", i=i + 1))
+
+        self.update_layer_selector()
+        self.update_player_step_label()
+        self.update_title()
+        self.update_chart()
 
     def update_layer_selector(self) -> None:
         cb = self.widgets.get("active_layer_combo")
         if not isinstance(cb, ttk.Combobox):
             return
         if not self.state.layers:
-            default_name = "Белая нить" if self.state.is_invert_board() else "Черная нить"
-            cb["values"] = [default_name]
-            self.state.vars["active_layer"].set(default_name)
+            raw_name = "Белая нить" if self.state.is_invert_board() else "Черная нить"
+            disp_name = translate_layer_name(raw_name, self.state.lang)
+            cb["values"] = [disp_name]
+            self.state.vars["active_layer"].set(disp_name)
             return
-        names = [l.get("name", f"Слой {i+1}") for i, l in enumerate(self.state.layers)]
-        cb["values"] = names
-        idx = min(self.state.active_layer_idx, len(names) - 1)
+        unit = self._t("unit_lines_short")
+        labels = [
+            f"{translate_layer_name(str(l.get('name', f'Layer {i+1}')), self.state.lang)} ({max(0, len(l.get('path', [])) - 1)} {unit})"
+            for i, l in enumerate(self.state.layers)
+        ]
+        cb["values"] = labels
+        idx = min(self.state.active_layer_idx, len(labels) - 1)
         self.state.active_layer_idx = max(0, idx)
-        self.state.vars["active_layer"].set(names[self.state.active_layer_idx])
+        self.state.vars["active_layer"].set(labels[self.state.active_layer_idx])
 
     def _on_active_layer_changed(self, _event=None) -> None:
         if not self.state.layers:
             return
-        sel_name = self.state.vars["active_layer"].get()
-        for idx, layer in enumerate(self.state.layers):
-            if layer.get("name") == sel_name:
-                self.state.active_layer_idx = idx
-                path = layer.get("path", [])
-                max_steps = max(1, len(path) - 1)
-                self.state.overall_best_chromosome = path
-                scale = self.widgets.get("step_scrubber_scale")
-                if isinstance(scale, ttk.Scale):
-                    scale.configure(to=max_steps)
-                self.state.vars["step_scrubber"].set(max_steps)
-                self.update_player_step_label()
-                self._on_visual_param_change()
-                break
+        cb = self.widgets.get("active_layer_combo")
+        idx = cb.current() if isinstance(cb, ttk.Combobox) else -1
+        if idx < 0 or idx >= len(self.state.layers):
+            sel_name = self.state.vars["active_layer"].get()
+            idx = next(
+                (
+                    i
+                    for i, l in enumerate(self.state.layers)
+                    if sel_name.startswith(translate_layer_name(str(l.get("name", "")), self.state.lang))
+                    or sel_name.startswith(str(l.get("name", "")))
+                ),
+                -1,
+            )
+        if 0 <= idx < len(self.state.layers):
+            self.state.active_layer_idx = idx
+            path = self.state.layers[idx].get("path", [])
+            max_steps = max(1, len(path) - 1)
+            self.state.overall_best_chromosome = path
+            scale = self.widgets.get("step_scrubber_scale")
+            if isinstance(scale, ttk.Scale):
+                scale.configure(to=max(1, max_steps))
+            self.state.vars["step_scrubber"].set(max_steps)
+            self.update_player_step_label()
+            self._on_visual_param_change()
 
     def _on_scrubber_slider_move(self, *_args) -> None:
         self.update_player_step_label()
@@ -698,15 +892,15 @@ class UIManager:
         if not lbl:
             return
         if not self.state.layers or self.state.active_layer_idx >= len(self.state.layers):
-            lbl.config(text="Ход: --")
+            lbl.config(text=self._t("player_idle"))
             return
         path = self.state.layers[self.state.active_layer_idx].get("path", [])
         if len(path) < 2:
-            lbl.config(text="Ход: --")
+            lbl.config(text=self._t("player_empty"))
             return
         total = len(path) - 1
         step = max(1, min(total, int(self.state.safe_get("step_scrubber"))))
-        lbl.config(text=f"Шаг {step}/{total}: гвоздь {path[step - 1]} → {path[step]}")
+        lbl.config(text=self._t("player_step", step=step, total=total, p1=path[step - 1], p2=path[step]))
 
     def _on_visual_param_change(self, *_args) -> None:
         if self.coordinator and self.state.layers:
@@ -744,14 +938,14 @@ class UIManager:
         self.result_canvases.clear()
         self.result_photo_refs.clear()
 
-        self._create_notebook_tab("overall", "★ Лучший результат", notebook)
+        self._create_notebook_tab("overall", self._t("tab_overall"), notebook)
         for i in range(num_islands):
-            self._create_notebook_tab(i, f"Остров {i + 1}", notebook)
+            self._create_notebook_tab(i, self._t("tab_island", i=i + 1), notebook)
 
-        self._create_analysis_canvas_tab(notebook, "diff_map", "Карта Ошибок (Кр/Син)")
-        self._create_analysis_canvas_tab(notebook, "density_heatmap", "Плотность нитей (Heatmap)")
-        self._create_analysis_canvas_tab(notebook, "fit_saliency", "Карта Значимости (DoG)")
-        self._create_analysis_canvas_tab(notebook, "radon_sinogram", "Радон + FBP")
+        self._create_analysis_canvas_tab(notebook, "diff_map", self._t("tab_diff_map"))
+        self._create_analysis_canvas_tab(notebook, "density_heatmap", self._t("tab_density"))
+        self._create_analysis_canvas_tab(notebook, "fit_saliency", self._t("tab_saliency"))
+        self._create_analysis_canvas_tab(notebook, "radon_sinogram", self._t("tab_radon"))
 
     def _create_analysis_canvas_tab(self, parent_notebook: ttk.Notebook, key: str, title: str) -> None:
         frame = ttk.Frame(parent_notebook)
@@ -778,7 +972,7 @@ class UIManager:
         for i in range(num_islands):
             frame = ttk.Frame(pb_frame)
             frame.pack(fill=tk.X, expand=False, pady=1)
-            label = ttk.Label(frame, text=f"Остров {i + 1}: старт", width=19, font=("Segoe UI", 8))
+            label = ttk.Label(frame, text=self._t("island_start", i=i + 1), width=19, font=("Segoe UI", 8))
             label.pack(side=tk.LEFT, padx=(0, 4))
             self.main_island_labels[i] = label
             pb = ttk.Progressbar(frame, orient="horizontal", mode="determinate")
@@ -800,14 +994,14 @@ class UIManager:
             data = self.state.chart_data_by_island.get(i, [])
             if data:
                 gens, fitnesses = zip(*data)
-                self.ax_fitness.plot(gens, fitnesses, label=f"Остров {i + 1}", color=colors[i], linewidth=1.5)
+                self.ax_fitness.plot(gens, fitnesses, label=self._t("tab_island", i=i + 1), color=colors[i], linewidth=1.5)
                 has_lines = True
         if self.state.omp_baseline_fitness > 0:
-            self.ax_fitness.axhline(self.state.omp_baseline_fitness, color="gray", linestyle=":", label="OMP База")
+            self.ax_fitness.axhline(self.state.omp_baseline_fitness, color="gray", linestyle=":", label=self._t("chart_omp_base"))
             has_lines = True
 
-        self.ax_fitness.set_title("Рост точности (Фитнес)", fontsize=9)
-        self.ax_fitness.set_xlabel("Поколения", fontsize=8)
+        self.ax_fitness.set_title(self._t("chart_fit_title"), fontsize=9)
+        self.ax_fitness.set_xlabel(self._t("chart_fit_xlabel"), fontsize=8)
         self.ax_fitness.tick_params(labelsize=8)
         if has_lines:
             self.ax_fitness.legend(loc="lower right", fontsize=7)
@@ -825,7 +1019,7 @@ class UIManager:
             self.ax_mut.set_xlim(0, max(35.0, max(rates) * 1.15))
             for bar, r in zip(bars, rates):
                 self.ax_mut.text(bar.get_width() + 0.8, bar.get_y() + bar.get_height() / 2, f"{r:.1f}%", va="center", fontsize=7)
-        self.ax_mut.set_title("КПД операторов мутации (%)", fontsize=9)
+        self.ax_mut.set_title(self._t("chart_mut_title"), fontsize=9)
         self.ax_mut.tick_params(labelsize=8)
         self.ax_mut.grid(True, axis="x", linestyle="--", alpha=0.6, color="#e1e4e8")
 
@@ -837,6 +1031,8 @@ class UIManager:
         if root_widget is None:
             return
         for child in root_widget.winfo_children():
+            if child is self.widgets.get("language_combo"):
+                continue
             if isinstance(child, ttk.Combobox):
                 child.configure(state="disabled" if state == tk.DISABLED else "readonly")
             elif isinstance(child, (ttk.Scale, ttk.Entry, ttk.Button, ttk.Checkbutton)):
@@ -883,17 +1079,19 @@ class UIManager:
                 self.widgets[key].config(state=export_state)
 
         if not is_running:
-            self.widgets["pause_button"].config(text="❚❚ Пауза")
+            self.widgets["pause_button"].config(text=self._t("btn_pause"))
             for i, pb in self.main_island_progress_bars.items():
                 pb["value"] = 0
                 if i in self.main_island_labels:
-                    self.main_island_labels[i].config(text=f"Остров {i + 1}: готово")
+                    self.main_island_labels[i].config(text=self._t("island_done", i=i + 1))
 
     def update_island_progress(self, island_id: int, stage: int, patience: int, limit: int) -> None:
         if island_id in self.main_island_labels:
             pct = int((patience / max(1, limit)) * 100)
             total_st = max(1, int(self.state.safe_get("stages")))
-            self.main_island_labels[island_id].config(text=f"Ост.{island_id + 1} Эт.{stage + 1}/{total_st}: {pct}%")
+            self.main_island_labels[island_id].config(
+                text=self._t("island_prog", i=island_id + 1, st=stage + 1, tot=total_st, pct=pct)
+            )
         if island_id in self.main_island_progress_bars:
             pb = self.main_island_progress_bars[island_id]
             pb["maximum"] = max(1, limit)
@@ -903,11 +1101,12 @@ class UIManager:
         n_lines = sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers)
         if n_lines == 0:
             n_lines = max(0, len(self.state.overall_best_chromosome or []) - 1)
-        self.widgets["fitness_label"].config(text=f"Точность: {fitness:.5f} ({n_lines} нитей)")
+        self.widgets["fitness_label"].config(text=self._t("fitness_val", fitness=fitness, lines=n_lines))
 
     def update_thread_length_display(self, length_in_meters: float) -> None:
+        self._last_thread_length_m = float(length_in_meters)
         dia = float(self.state.safe_get("physical_diameter") or 50.0)
-        self.widgets["len_label"].config(text=f"{length_in_meters:.1f} м (на Ø{dia:.0f}см)")
+        self.widgets["len_label"].config(text=self._t("len_fmt", m=length_in_meters, dia=dia))
 
     def update_stats_display(self, current_state: AppState) -> None:
         elapsed = time.time() - current_state.start_time
@@ -930,7 +1129,7 @@ class UIManager:
             eta = (elapsed / avg_progress) * max(0.0, 1.0 - avg_progress)
             self.widgets["eta_label"].config(text=time.strftime("%H:%M:%S", time.gmtime(eta)))
         else:
-            self.widgets["eta_label"].config(text="Расчет...")
+            self.widgets["eta_label"].config(text=self._t("eta_calc"))
 
     def update_canvas_image(self, key: Any, img_pil: Image.Image) -> None:
         self.raw_pil_images[key] = img_pil
@@ -942,7 +1141,6 @@ class UIManager:
             return
 
         if key == "radon_sinogram":
-            # Сохраняем соотношение сторон широкой панели Синограмма + FBP
             scale = min((w - 8) / max(1, img_pil.width), (h - 8) / max(1, img_pil.height))
             nw = max(40, int(round(img_pil.width * scale)))
             nh = max(40, int(round(img_pil.height * scale)))
@@ -958,7 +1156,7 @@ class UIManager:
                 split_pct = int(self.state.safe_get("split_compare") or 0)
                 if split_pct > 0:
                     split_x = int(display_size * (split_pct / 100.0))
-                    is_color = "CMYK" in str(self.state.safe_get("color_mode"))
+                    is_color = "CMYK" in to_canonical_color_mode(str(self.state.safe_get("color_mode")))
                     if is_color and self.state.preprocessed_rgb_np is not None:
                         target_src = self.state.preprocessed_rgb_np
                         comp_np = np.array(img_shown.convert("RGB"))
@@ -990,9 +1188,9 @@ class UIManager:
 
 
 class StringArtApp(tk.Tk):
-    """Главное окно String Art Studio Pro."""
+    """Главное окно String Art Studio Pro (автоопределение RU / EN по языку системы)."""
 
-    def __init__(self):
+    def __init__(self, lang: Optional[str] = None):
         enable_windows_high_dpi()
         super().__init__()
         self.geometry("1540x940")
@@ -1000,9 +1198,9 @@ class StringArtApp(tk.Tk):
 
         self._load_window_icon()
 
-        self.state = AppState()
+        self.state = AppState(lang=lang)
         self.queues = {"status_queue": queue.Queue()}
-        self.audio_assistant = AudioAssistant()
+        self.audio_assistant = AudioAssistant(lang=self.state.lang)
         self.ui_manager = UIManager(self, self.state)
         self.coordinator = EvolutionCoordinator(self, self.state, self.ui_manager, self.queues, self.audio_assistant)
         self.ui_manager.coordinator = self.coordinator
@@ -1018,12 +1216,28 @@ class StringArtApp(tk.Tk):
         self.after(800, self._periodic_ui_update)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+    def _t(self, key: str, **kwargs) -> str:
+        return tr(key, self.state.lang, **kwargs)
+
+    def set_language(self, lang: str, persist: bool = True) -> None:
+        """Переключает язык интерфейса на лету ('ru' или 'en') без перезапуска."""
+        code = normalize_lang(lang)
+        self.state.lang = code
+        self.audio_assistant.set_language(code)
+        if persist:
+            save_language_preference(code)
+        self.ui_manager.apply_language(code)
+
     def _load_window_icon(self) -> None:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for cand in [
+        candidates = [
             os.path.join(base_dir, "StringArt.ico"),
             os.path.join(os.getcwd(), "StringArt.ico"),
-        ]:
+        ]
+        meipass = getattr(__import__("sys"), "_MEIPASS", None)
+        if meipass:
+            candidates.insert(0, os.path.join(meipass, "StringArt.ico"))
+        for cand in candidates:
             if os.path.exists(cand):
                 try:
                     self.iconbitmap(cand)
@@ -1056,7 +1270,7 @@ class StringArtApp(tk.Tk):
         self.bind("<Control-s>", lambda _e: self.coordinator.save_project())
 
     def on_closing(self) -> None:
-        if self.state.is_running and not messagebox.askokcancel("Выход", "Генерация еще выполняется. Остановить и выйти?"):
+        if self.state.is_running and not messagebox.askokcancel(self._t("dlg_exit_title"), self._t("dlg_exit_msg")):
             return
         if self._auto_play_job:
             self.after_cancel(self._auto_play_job)
@@ -1072,15 +1286,24 @@ class StringArtApp(tk.Tk):
         self.after(800, self._periodic_ui_update)
 
     def on_preset_selected(self, _event=None) -> None:
-        name = self.state.vars["preset"].get()
-        preset = PRESETS.get(name)
+        disp_name = str(self.state.vars["preset"].get())
+        canon_name = to_canonical_preset(disp_name)
+        preset = PRESETS.get(canon_name)
         if preset is None:
             self.apply_auto_recommendations()
             return
+        lang = self.state.lang
         for k, v in preset.items():
             if k in self.state.vars:
+                if k == "canvas_shape":
+                    v = to_display_shape(str(v), lang)
+                elif k == "color_mode":
+                    v = to_display_color_mode(str(v), lang)
                 self.state.vars[k].set(v)
-        self.ui_manager.widgets["analysis_label"].config(text=f"Пресет: {name}", foreground="#0969da")
+        self.ui_manager.widgets["analysis_label"].config(
+            text=self._t("analysis_preset", name=to_display_preset(canon_name, lang)),
+            foreground="#0969da",
+        )
         self.redraw_target_canvas()
 
     def on_voice_toggle(self) -> None:
@@ -1108,12 +1331,12 @@ class StringArtApp(tk.Tk):
             self.after_cancel(self._auto_play_job)
             self._auto_play_job = None
             if btn:
-                btn.config(text="▶ Авто")
+                btn.config(text=self._t("btn_auto_play"))
         else:
             if not self.state.layers:
                 return
             if btn:
-                btn.config(text="❚❚ Стоп")
+                btn.config(text=self._t("btn_auto_stop"))
             self._auto_play_tick()
 
     def _auto_play_tick(self) -> None:
@@ -1142,16 +1365,16 @@ class StringArtApp(tk.Tk):
             self.state.original_image_path = file_path
             self.ui_manager.update_title()
             self.apply_auto_recommendations()
-            self.ui_manager.widgets["status_label"].config(text="Изображение загружено и параметры подобраны.")
+            self.ui_manager.widgets["status_label"].config(text=self._t("msg_loaded_ok"))
         except Exception as exc:
             logging.error("Не удалось загрузить изображение", exc_info=True)
-            messagebox.showerror("Ошибка", f"Не удалось загрузить изображение:\n{exc}")
+            messagebox.showerror(self._t("dlg_error"), self._t("msg_load_err", err=exc))
 
     def apply_auto_recommendations(self) -> None:
         if not self.state.original_image:
             return
-        shape = str(self.state.safe_get("canvas_shape") or "Круг")
-        rec = auto_recommend_parameters(self.state.original_image, shape)
+        shape = to_canonical_shape(str(self.state.safe_get("canvas_shape") or "Круг"))
+        rec = auto_recommend_parameters(self.state.original_image, shape, lang=self.state.lang)
         for k in [
             "pins",
             "lines",
@@ -1179,13 +1402,14 @@ class StringArtApp(tk.Tk):
         if w < 20 or h < 20:
             return
         display_size = max(60, min(w, h) - 10)
-        color_mode = str(self.state.safe_get("color_mode") or "Монохром (Черная нить)")
+        color_mode = to_canonical_color_mode(str(self.state.safe_get("color_mode") or "Монохром (Черная нить)"))
+        shape = to_canonical_shape(str(self.state.safe_get("canvas_shape") or "Круг"))
         bundle = prepare_target_image_bundle(
             self.state.original_image,
             display_size,
             clahe_clip=float(self.state.safe_get("clahe_clip") or 1.3),
             gamma=float(self.state.safe_get("gamma") or 0.82),
-            shape=str(self.state.safe_get("canvas_shape") or "Круг"),
+            shape=shape,
             color_mode=color_mode,
         )
         self.state.preprocessed_target_np = bundle["gray"]

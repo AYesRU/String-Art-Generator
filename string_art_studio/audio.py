@@ -20,16 +20,20 @@ except Exception:
 
 
 class AudioAssistant:
-    """Потокобезопасный голосовой диктор номеров гвоздей для работы без экрана."""
+    """Потокобезопасный голосовой диктор номеров гвоздей для работы без экрана (RU / EN)."""
 
-    def __init__(self):
+    def __init__(self, lang: str = "ru"):
         self.enabled: bool = False
+        self.lang: str = "ru" if str(lang).lower().startswith("ru") else "en"
         self.available: bool = SAPI_AVAILABLE
         self.speech_queue: queue.Queue = queue.Queue()
         self.worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         if SAPI_AVAILABLE:
             self._start_worker()
+
+    def set_language(self, lang: str) -> None:
+        self.lang = "ru" if str(lang).lower().startswith("ru") else "en"
 
     def _start_worker(self) -> None:
         self.worker_thread = threading.Thread(target=self._worker_loop, name="VoiceWorker", daemon=True)
@@ -75,7 +79,8 @@ class AudioAssistant:
 
     def announce_chord(self, from_pin: int, to_pin: int) -> None:
         if self.enabled and self.available:
-            self.speech_queue.put(f"на {to_pin}")
+            phrase = f"на {to_pin}" if self.lang == "ru" else f"to {to_pin}"
+            self.speech_queue.put(phrase)
 
     def toggle(self, state: bool) -> None:
         self.enabled = bool(state)

@@ -1,4 +1,4 @@
-# String Art Studio Pro v9.6 🎨🧵
+# String Art Studio Pro v9.7 🎨🧵
 
 <div align="center">
 
@@ -18,16 +18,21 @@
 <a name="english"></a>
 ## 🇬🇧 English
 
-**String Art Studio Pro v9.6** is an open-source algorithmic studio for generating high-definition **String Art** (thread art / filography / изонить) artworks from continuous thread paths — supporting **Monochrome Black Thread**, **White Thread on Dark Board**, and **4-Layer Subtractive CMYK Color**.
+**String Art Studio Pro v9.7** is an open-source algorithmic studio for generating high-definition **String Art** (thread art / filography / изонить) artworks from continuous thread paths — supporting **Monochrome Black Thread**, **White Thread on Dark Board**, and **Adaptive 4-Layer Subtractive CMYK Color**.
 
-It combines tomography mathematics (**Radon Transform + Ram-Lak Filtered Back Projection**), a **6,700+ lines/sec Pre-Sliced DDA SciPy CSR Orthogonal Matching Pursuit (OMP)** initializer with background-zone protection ("no mush"), a multi-threaded **Island Genetic Algorithm (GA)** with `O(L)` scratch-buffer best-of-2 delta memetic polishing, **PyTorch CUDA GPU** batch fitness & Beer-Lambert optical rendering (`~7 ms` at 550px, `~60 ms` at 2400px Ultra-HD on RTX 5060, with seamless CPU fallback), and full `.sart.json` project persistence.
+It combines tomography mathematics (**Radon Transform + Ram-Lak Filtered Back Projection**), an **Exact Beer-Lambert Pre-Sliced DDA SciPy CSR Orthogonal Matching Pursuit (OMP)** initializer with per-channel physical thread budgets (automatically assigning **0 threads** to absent CMYK colors), a variable-length multi-threaded **Island Genetic Algorithm (GA)** with `O(L)` scratch-buffer delta thread pruning & insertion (decreasing excess threads and adding missing ones up to `max_lines`), **PyTorch CUDA GPU** batch fitness & optical rendering (`~7 ms` at 550px, `~60 ms` at 2400px Ultra-HD on RTX 5060, with seamless CPU fallback), and full `.sart.json` project persistence.
 
-### 🌟 Key Features (v9.6)
-* ⚡ **Ultra-Fast Hybrid Engine (DDA CSR OMP + CUDA + Island GA)**:
+### 🌟 Key Features (v9.7)
+* ⚡ **Ultra-Fast Adaptive Engine (Exact Beer-Lambert DDA CSR OMP + CUDA + Variable-Length Island GA)**:
   * **Vectorized Integer DDA CSR (`build_line_tables`)**: Builds 29,250 chords (260 pins) in `~390 ms` with **zero duplicate pixels** per chord.
-  * **Pre-Sliced CSR `pixel_gain` OMP**: Evaluates candidate chords without CSR slicing copies (`~6,700 lines/sec` end-to-end on CPU) while enforcing background protection (`white_guard`).
+  * **Exact Beer-Lambert Pre-Sliced CSR OMP**: Evaluates exact per-pixel Beer-Lambert error reduction (`~5,300–6,700 lines/sec` on CPU), stops cleanly without forced minimums, trims trailing bridge hops to the global-best prefix, and outputs **0 threads** for absent color channels.
+  * **Bidirectional Adaptive Thread Count (`optimize_thread_count_delta`)**: Automatically removes excess over-darkening threads (`A→B→C` → `A→C`, down to `0` if empty is cleaner) and adds deficit threads up to the configured maximum (`max_lines`).
+  * **Per-Channel CMYK Budgets (`estimate_channel_line_budget`)**: Computes individual thread budgets for Cyan, Magenta, Yellow, and Black from each channel's Beer-Lambert optical-depth integral before synthesis, keeping identical physical thread opacity (`ref_lines`) across all 4 spools.
   * **PyTorch CUDA Batch Fitness & Rendering**: Shares a single cached sparse matrix in VRAM across CMYK layers and polish runs (`~12.6 ms` for 24 chromosomes on RTX 5060) and accelerates Beer-Lambert preview/Ultra-HD rendering by **11–12×** (`~7 ms` at 550px, `~60 ms` at 2400px), with automatic CPU fallback.
-  * **Island GA & `O(L)` Scratch-Buffer Delta Search**: Independent island threads with elite migration, boundary-validated crossover (`min_pin_dist` invariant), 4 graph mutators (*Smart Hinge*, *Radon Bridge*, *2-Opt Invert*, *Jitter Pin*), and **2.4× faster** `O(L)` delta evaluation checking both Radon and local-jitter candidates per step.
+  * **Variable-Length Island GA & `O(L)` Delta Polish**: Independent island threads with elite migration, variable-length boundary-validated crossover (`min_pin_dist` invariant), 6 graph mutators (*Smart Hinge*, *Radon Bridge*, *2-Opt Invert*, *Jitter Pin*, *Prune Excess*, *Insert Thread*), and `O(L)` scratch-buffer delta evaluation (replace / prune / insert per step).
+* 🌍 **Bilingual Interface (English / Русский) with OS Auto-Detection**:
+  * Automatically detects the operating system UI language on first launch (Russian OS → Russian, all other locales → English), with a live **Language switcher** in the top sidebar (no restart required; persists preference, or override via `STRINGART_LANG=en|ru`).
+  * Full localization across all controls, tooltips, analytics charts, Windows SAPI voice dictation (`"to 142"` / `"на 142"`), and exported files (`.txt`, `.csv`, `1:1 .svg` drill template, and interactive `.html` Web Assistant).
 * 🎨 **6 Frame Geometries & 3 Color Modes**:
   * **Shapes**: Circle, Square, Rectangle (4:3 & 16:9), Oval, Hexagon — with unified polygon masking and frame-fit image scaling.
   * **Color Modes**: **Monochrome (Black Thread)**, **White Thread (Dark Board `#121418`)**, and **4-Layer Subtractive CMYK** (Cyan, Magenta, Yellow, Black) with **per-channel Sobel contours & Radon sinograms** for crisp color separation.
@@ -39,7 +44,7 @@ It combines tomography mathematics (**Radon Transform + Ram-Lak Filtered Back Pr
 * 📊 **Live Matplotlib Analytics & Diagnostic Tabs**:
   * Real-time island convergence curves, OMP baseline, mutation operator KPI bar chart, Error Map (Red/Blue), Thread Density Heatmap, DoG Saliency Map, and Radon + FBP view.
 * 🔊 **Interactive Physical Weaving Assistants**:
-  * **Built-in Step Player**: Interactive scrubber, layer switcher, neon active-chord highlight, Auto-Play, Before/After split curtain, and **Windows SAPI Voice** (`"на 142"`).
+  * **Built-in Step Player**: Interactive scrubber, layer switcher, neon active-chord highlight, Auto-Play, Before/After split curtain, and **Windows SAPI Voice** (`"to 142"` / `"на 142"`).
   * **Autonomous HTML5 Web App**: Standalone `.html` export with Web Speech API, multi-layer CMYK & Dark Board support, isolated per-project `localStorage` keys, `O(1)` precomputed meterage, jump-to-step input, autoplay speed selector, and Light/Dark UI theme toggle.
 * 📦 **7 Export Formats**:
   * `.txt` step-by-step map with cumulative meters & 500m spool estimate
@@ -74,20 +79,23 @@ python -m unittest discover -s tests -v
 <a name="русский"></a>
 ## 🇷🇺 Русский
 
-**String Art Studio Pro v9.6** — студия и высокопроизводительный алгоритмический комплекс с открытым исходным кодом для генерации картин в технике **String Art** (изонить / филография) из непрерывной нити: классические монохромные портреты, **белая нить на темной доске** и цветные **4-слойные CMYK** композиции.
+**String Art Studio Pro v9.7** — студия и высокопроизводительный алгоритмический комплекс с открытым исходным кодом для генерации картин в технике **String Art** (изонить / филография) из непрерывной нити: классические монохромные портреты, **белая нить на темной доске** и адаптивные цветные **4-слойные CMYK** композиции.
 
-### 🌟 Ключевые возможности v9.6
+### 🌟 Ключевые возможности v9.7
 
-#### 1. ⚡ Гибридный движок: DDA CSR OMP + PyTorch CUDA + Островной ГА
+#### 1. ⚡ Гибридный адаптивный движок: Beer-Lambert DDA CSR OMP + PyTorch CUDA + Островной ГА переменной длины
 * **Векторизованный целочисленный DDA CSR (`~390 мс`)**: построение 29 250 хорд (260 гвоздей) без сортировок `np.unique` и с **нулем дубликатов пикселей** в каждой хорде.
-* **Преднарезанный CSR OMP (~6 700 нитей/сек на CPU)**: оценка всех допустимых хорд через преднарезанные подматрицы `pin_sub_matrices` без копирования CSR в цикле + защита фона (`white_guard`) от «каши».
-* **Ускорение на GPU NVIDIA CUDA (PyTorch) для фитнеса и рендера**:
-  * Общий кэш разреженной матрицы в VRAM (1 загрузка на геометрию вместо 4 в CMYK), пакетная оценка 24 хромосом за `~12.6 мс` на RTX 5060.
-  * CUDA-рендер закона Бера-Ламберта: **12.5× быстрее CPU** (`~7.1 мс` на превью 550px и `~60 мс` на Ultra-HD 2400px), автоматический откат на CPU.
-* **Островная эволюция (`IslandThread`) и `O(L)` дельта-спуск**: независимые потоки с миграцией, проверка `min_pin_dist` на обоих стыках кроссовера, 4 графовых мутатора и **2.4× более быстрый** дельта-поиск на `int8` scratch-буфере (оценка пары кандидатов Радон + локальный сдвиг на шаг).
-* **Кнопка «✨ Доводка»**: эволюционная полировка поверх готовой нити без перезапуска OMP.
+* **Точный Beer-Lambert CSR OMP**: вычисляет точный выигрыш оптической модели по преднарезанным подматрицам `pin_sub_matrices` без принудительного минимума нитей, обрезает холостой хвост до лучшего префикса и ставит **0 нитей** для отсутствующих цветов (например, 0 синих нитей на красной картине).
+* **Индивидуальный расчет нитей по цветам CMYK (`estimate_channel_line_budget`)**: на старте рассчитывает физический бюджет нитей отдельно для Cyan, Magenta, Yellow и Black по интегралу оптической глубины Бера-Ламберта, сохраняя единую физическую плотность нити (`ref_lines`) для всех 4 катушек.
+* **Двунаправленная адаптация числа нитей (`optimize_thread_count_delta`)**: автоматически **уменьшает** число нитей при их избытке (схлопывание `A→B→C` → `A→C`, удаление краевых хорд, вплоть до `0`) и **добавляет** недостающие нити при нехватке, строго не превышая заданный максимум (`max_lines`).
+* **Островная эволюция переменной длины (`IslandThread`)**: независимые потоки с миграцией, кроссовером разной длины, **6 графовыми мутаторами** (*Smart Hinge*, *Radon Bridge*, *2-Opt Invert*, *Jitter Pin*, *Prune Excess*, *Insert Thread*) и `O(L)` дельта-спуском на `int8` scratch-буфере (замена, удаление и вставка нитей на каждом шаге).
+* **Ускорение на GPU NVIDIA CUDA (PyTorch) для фитнеса и рендера**: общий кэш матрицы в VRAM (`~12.6 мс` на 24 хромосомы на RTX 5060) и CUDA-рендер Бера-Ламберта в **11–12× быстрее CPU** (`~7.1 мс` при 550px и `~60 мс` при 2400px).
 
-#### 2. 📐 6 геометрий холста, Темная доска и улучшенный CMYK
+#### 2. 🌍 Двуязычный интерфейс (Русский / English) с автоопределением языка ОС
+* **Автовыбор языка при запуске**: если язык системы русский — интерфейс открывается на русском, на всех остальных системах — на английском (можно принудительно задать через `STRINGART_LANG=ru|en`).
+* **Мгновенное переключение в интерфейсе**: переключатель `Язык / Lang` в верхней панели переводит все вкладки, подсказки, графики, голосового диктора Windows SAPI (`"на 142"` / `"to 142"`) и экспортируемые файлы (`.txt`, `.csv`, шаблон `1:1 .svg`, HTML5 веб-ассистент) без перезапуска.
+
+#### 3. 📐 6 геометрий холста, Темная доска и улучшенный CMYK
 * **Формы рамы**: Круг, Квадрат, Прямоугольник (4:3 и 16:9), Овал, Шестиугольник — единая полигональная маска и точное вписывание изображения.
 * **3 режима цвета**:
   * **Монохром (Черная нить)** на белой основе;
@@ -95,12 +103,12 @@ python -m unittest discover -s tests -v
   * **Цветной CMYK (4 нити)** с **индивидуальными контурами Собеля и синограммами Радона для каждого канала** (C, M, Y, K).
 * **Сохранение и загрузка проектов (`.sart.json`)**: сохраняйте настройки, все слои и текущий шаг сборки (`Ctrl+S`), чтобы продолжить позже.
 
-#### 3. 🌀 Преобразование Радона (Ramp FBP) и аналитика
+#### 4. 🌀 Преобразование Радона (Ramp FBP) и аналитика
 * **Точная синограмма Радона** с частотным фильтром Рама-Лака (окно Хэмминга) и визуализацией FBP.
 * **Метрики краев**: «Преобразование расстояний» (`distance_transform_edt`) и «Контуры» (Sobel + DoG + FineGrained Saliency).
 * **Согласованная яркость**: единая калибровка `get_line_alpha` между оптимизатором, превью и Ultra-HD PNG на любых объемах нитей (600–4500).
 
-#### 4. 🔊 Интерактивный плеер и 7 форматов экспорта
+#### 5. 🔊 Интерактивный плеер и 7 форматов экспорта
 * **Студийный плеер**: ползунок шагов, `◀ Назад` / `▶ Авто` / `Вперед ▶`, переключение слоев CMYK, неоновая подсветка активной нити, шторка «До / После» и **голосовая диктовка через Windows SAPI**.
 * **Полный экспорт**:
   * **.txt** — пошаговая схема с кумулятивным метражом и расчетом катушек (500м);
@@ -129,15 +137,16 @@ python -m unittest discover -s tests -v
 StringArt_Studio/
 ├── string-art-generator.py         # Точка входа приложения
 ├── string_art_studio/
+│   ├── i18n.py                     # Двуязычная локализация (RU/EN) и автоопределение языка ОС
 │   ├── geometry.py                 # Геометрия 6 форм, DDA CSR, GPU-кэш и CUDA/CPU рендер
 │   ├── preprocessing.py            # Предобработка, маска, DoG/Saliency, Dark Board, CMYK
 │   ├── radon.py                    # Синограмма Радона, фильтр Рама-Лака и FBP
 │   ├── engine.py                   # Pre-sliced CSR OMP, CUDA/CPU Fitness, Island GA и O(L) дельта-поиск
-│   ├── audio.py                    # Голосовой диктор Windows SAPI
+│   ├── audio.py                    # Голосовой диктор Windows SAPI (RU/EN)
 │   ├── exporters.py                # TXT, CSV, G-Code (Y-up), SVG, Шаблон 1:1, PNG, HTML5, .sart.json
 │   ├── coordinator.py              # AppState и потокобезопасный EvolutionCoordinator (run_id, async PNG)
-│   └── ui.py                       # Интерфейс (Light Theme), плеер и живые графики Matplotlib
-├── tests/                          # Автоматические тесты (15 тестов unittest)
+│   └── ui.py                       # Интерфейс (Light Theme), плеер, живые графики и переключатель языка
+├── tests/                          # Автоматические тесты (23 теста unittest)
 ├── requirements.txt
 └── run_studio.bat
 ```

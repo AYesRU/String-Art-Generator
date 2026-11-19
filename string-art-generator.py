@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-String Art Studio Pro v9.6 — точка входа приложения.
-Гибридный комплекс: DDA CSR OMP + Островной ГА (Island GA) + Преобразование Радона (Ramp FBP)
-+ Пакетное ускорение и рендер GPU CUDA (PyTorch) + Монохром / Темная доска / CMYK + Проекты .sart.json.
+String Art Studio Pro v9.7 — точка входа приложения.
+Гибридный комплекс: точный Beer-Lambert DDA CSR OMP + Островной ГА переменной длины (удаление/добавление нитей)
++ Преобразование Радона (Ramp FBP) + GPU CUDA (PyTorch) + Монохром / Темная доска / адаптивный CMYK + .sart.json.
 """
 
 import logging
@@ -20,10 +20,13 @@ from string_art_studio.engine import (
     GreedyInitializer,
     IslandManagerThread,
     IslandThread,
+    estimate_channel_line_budget,
+    optimize_thread_count_delta,
     prune_chromosome_loops,
 )
 from string_art_studio.exporters import load_project_json, save_project_json
 from string_art_studio.geometry import CanvasManager
+from string_art_studio.i18n import detect_system_language, tr
 from string_art_studio.preprocessing import (
     auto_recommend_parameters,
     prepare_target_image,
@@ -45,12 +48,15 @@ __all__ = [
     "GreedyInitializer",
     "IslandThread",
     "IslandManagerThread",
+    "estimate_channel_line_budget",
+    "optimize_thread_count_delta",
     "prune_chromosome_loops",
     "prepare_target_image",
     "prepare_target_image_bundle",
     "auto_recommend_parameters",
     "save_project_json",
     "load_project_json",
+    "detect_system_language",
     "AppState",
     "UIManager",
     "EvolutionCoordinator",
@@ -64,10 +70,14 @@ if __name__ == "__main__":
             os.environ["OPENCV_SALIENCY_PATH"] = os.path.join(sys._MEIPASS, "opencv-saliency")
         main()
     except Exception:
-        logging.critical("Критическая ошибка при запуске приложения", exc_info=True)
+        logging.critical("Critical error while starting application", exc_info=True)
         try:
+            lang = detect_system_language()
             root = tk.Tk()
             root.withdraw()
-            messagebox.showerror("Критическая ошибка", f"Не удалось запустить приложение:\n\n{traceback.format_exc()}")
+            messagebox.showerror(
+                tr("dlg_crit_err", lang),
+                tr("msg_crit_start_err", lang, tb=traceback.format_exc()),
+            )
         except Exception:
             pass

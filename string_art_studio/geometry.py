@@ -19,6 +19,7 @@ import scipy.sparse as sp
 from PIL import Image
 
 from . import IMAGE_SIZE
+from .i18n import to_canonical_shape
 
 try:
     import torch
@@ -49,7 +50,7 @@ class CanvasManager:
     ):
         self.size = int(size)
         self.num_pins = int(num_pins)
-        self.shape = shape
+        self.shape = to_canonical_shape(shape)
         self.physical_cm = float(physical_cm)
         self.pin_coords = self._calculate_pin_coords()
 
@@ -625,7 +626,7 @@ class CanvasManager:
         """
         out_dim = int(output_size) if output_size is not None else self.size
         bg_val = 18 if invert_board else 255
-        if not layers or sum(len(l.get("path", [])) for l in layers) < 2:
+        if not layers or all(len(l.get("path", [])) < 2 for l in layers):
             return np.full((out_dim, out_dim, 3), bg_val, dtype=np.uint8)
 
         is_color = len(layers) > 1
@@ -634,7 +635,8 @@ class CanvasManager:
             path = layers[0].get("path", [])
             total_lines = max(0, len(path) - 1)
             draw_count = total_lines if max_step is None else min(total_lines, max(0, int(max_step)))
-            alpha_500 = self.get_line_alpha(max(400, total_lines), line_weight_percent)
+            ref_n = max(400, int(layers[0].get("ref_lines") or total_lines))
+            alpha_500 = self.get_line_alpha(ref_n, line_weight_percent)
             depth_2d = self._accumulate_path_depth(path, draw_count, out_dim, thickness, alpha_500)
             if invert_board:
                 intensity = np.clip(1.0 - np.exp(-depth_2d * 1.6), 0.0, 1.0)
@@ -664,7 +666,8 @@ class CanvasManager:
                 if draw_count <= 0:
                     continue
 
-                alpha_500 = self.get_line_alpha(max(400, total_lines), line_weight_percent)
+                ref_n = max(400, int(layer.get("ref_lines") or total_lines))
+                alpha_500 = self.get_line_alpha(ref_n, line_weight_percent)
                 d_layer = self._accumulate_path_depth(path, draw_count, out_dim, thickness, alpha_500)
                 name = layer.get("name", "").lower()
                 if "cyan" in name or "циан" in name or "голуб" in name:

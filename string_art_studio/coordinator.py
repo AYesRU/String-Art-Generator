@@ -26,6 +26,8 @@ from .engine import (
     FitnessCalculator,
     GreedyInitializer,
     IslandManagerThread,
+    estimate_channel_line_budget,
+    optimize_thread_count_delta,
     prune_chromosome_loops,
 )
 from .exporters import (
@@ -40,6 +42,22 @@ from .exporters import (
     save_project_json,
 )
 from .geometry import CanvasManager
+from .i18n import (
+    LANGUAGE_LABELS,
+    detect_system_language,
+    layer_short_code,
+    normalize_lang,
+    to_canonical_color_mode,
+    to_canonical_metric,
+    to_canonical_preset,
+    to_canonical_shape,
+    to_display_color_mode,
+    to_display_metric,
+    to_display_preset,
+    to_display_shape,
+    tr,
+    translate_layer_name,
+)
 from .preprocessing import prepare_target_image_bundle
 from .radon import RadonGuide
 
@@ -48,15 +66,18 @@ if TYPE_CHECKING:
 
 
 class AppState:
-    """Хранилище параметров и текущего состояния синтеза/плеера."""
+    """Хранилище параметров и текущего состояния синтеза/плеера (RU / EN)."""
 
-    def __init__(self):
+    def __init__(self, lang: Optional[str] = None):
+        self.lang: str = normalize_lang(lang) if lang else detect_system_language()
+        default_metric = "Преобразование расстояний" if SCIPY_AVAILABLE else "Контуры"
         self.vars: Dict[str, tk.Variable] = {
-            "preset": tk.StringVar(value="Авто (по изображению)"),
+            "language": tk.StringVar(value=LANGUAGE_LABELS[self.lang]),
+            "preset": tk.StringVar(value=to_display_preset("Авто (по изображению)", self.lang)),
             "clahe_clip": tk.DoubleVar(value=1.3),
             "gamma": tk.DoubleVar(value=0.82),
-            "canvas_shape": tk.StringVar(value="Круг"),
-            "color_mode": tk.StringVar(value="Монохром (Черная нить)"),
+            "canvas_shape": tk.StringVar(value=to_display_shape("Круг", self.lang)),
+            "color_mode": tk.StringVar(value=to_display_color_mode("Монохром (Черная нить)", self.lang)),
             "physical_diameter": tk.DoubleVar(value=50.0),
             "pins": tk.IntVar(value=260),
             "lines": tk.IntVar(value=1400),
@@ -68,9 +89,7 @@ class AppState:
             "stages": tk.IntVar(value=5),
             "mutation_rate": tk.IntVar(value=18),
             "migration_interval": tk.IntVar(value=20),
-            "structural_metric": tk.StringVar(
-                value="Преобразование расстояний" if SCIPY_AVAILABLE else "Контуры"
-            ),
+            "structural_metric": tk.StringVar(value=to_display_metric(default_metric, self.lang)),
             "contour_weight": tk.IntVar(value=55),
             "memetic_enabled": tk.BooleanVar(value=True),
             "memetic_intensity": tk.IntVar(value=20),
@@ -78,7 +97,7 @@ class AppState:
             "radon_enabled": tk.BooleanVar(value=True),
             "radon_influence": tk.IntVar(value=35),
             "step_scrubber": tk.IntVar(value=1400),
-            "active_layer": tk.StringVar(value="Черная нить"),
+            "active_layer": tk.StringVar(value=translate_layer_name("Черная нить", self.lang)),
             "show_active_chord": tk.BooleanVar(value=True),
             "voice_enabled": tk.BooleanVar(value=False),
             "split_compare": tk.IntVar(value=0),
@@ -113,10 +132,17 @@ class AppState:
             return self._defaults.get(key)
 
     def get_config(self) -> Dict[str, Any]:
-        return {k: self.safe_get(k) for k in self.vars}
+        cfg = {k: self.safe_get(k) for k in self.vars}
+        # Канонические значения для движка/экспорта/совместимости .sart.json между RU и EN
+        cfg["preset"] = to_canonical_preset(str(cfg.get("preset", "")))
+        cfg["canvas_shape"] = to_canonical_shape(str(cfg.get("canvas_shape", "Круг")))
+        cfg["color_mode"] = to_canonical_color_mode(str(cfg.get("color_mode", "Монохром (Черная нить)")))
+        cfg["structural_metric"] = to_canonical_metric(str(cfg.get("structural_metric", "Контуры")))
+        cfg["language"] = self.lang
+        return cfg
 
     def is_invert_board(self) -> bool:
-        mode = str(self.safe_get("color_mode") or "")
+        mode = to_canonical_color_mode(str(self.safe_get("color_mode") or ""))
         return "Белая нить" in mode or "Темная" in mode
 
     def reset_for_new_run(self, reset_layers: bool = True) -> None:
@@ -269,13 +295,16 @@ class EvolutionCoordinator:
         self._run_id += 1
         return self._run_id
 
+    def _t(self, key: str, **kwargs) -> str:
+        return tr(key, self.state.lang, **kwargs)
+
     def start_evolution_only(self) -> None:
         """Запуск параллельной островной эволюции на текущем пути без перезапуска OMP."""
         if self.state.original_image is None:
-            messagebox.showwarning("Внимание", "Пожалуйста, сначала загрузите изображение.")
+            messagebox.showwarning(self._t("dlg_warn"), self._t("msg_load_first"))
             return
         if not self.state.overall_best_chromosome or len(self.state.overall_best_chromosome) < 4:
-            messagebox.showinfo("Информация", "Базовый путь еще не создан. Запускаем полный цикл OMP + Острова...")
+            messagebox.showinfo(self._t("dlg_info"), self._t("msg_no_base_path"))
             self.start_generation()
             return
 
@@ -296,8 +325,9 @@ class EvolutionCoordinator:
         t.start()
 
     def _run_islands_only_worker(self, config: Dict[str, Any], run_id: int) -> None:
+        lang = config.get("language", self.state.lang)
         try:
-            self._send_status(f"Подготовка фитнес-калькулятора для {config['num_islands']} островов...", run_id=run_id)
+            self._send_status(tr("st_prep_fc", lang, n=config["num_islands"]), run_id=run_id)
             bundle = prepare_target_image_bundle(
                 self.state.original_image,
                 IMAGE_SIZE,
@@ -313,8 +343,16 @@ class EvolutionCoordinator:
             active_idx = min(self.state.active_layer_idx, len(bundle["channels"]) - 1)
             ch_data = bundle["channels"][max(0, active_idx)]
             ch_edges = ch_data.get("edges", bundle["edges"])
+            is_cmyk = len(bundle["channels"]) > 1
+            layer_max_lines = (
+                estimate_channel_line_budget(
+                    ch_data["darkness"], bundle["mask"], cm, config["lines"], config["line_weight"]
+                )
+                if is_cmyk
+                else int(config["lines"])
+            )
 
-            if self.radon_guide is None and config.get("radon_enabled", True):
+            if self.radon_guide is None and config.get("radon_enabled", True) and layer_max_lines > 0:
                 self.radon_guide = RadonGuide(
                     bundle["gray"],
                     ch_edges,
@@ -336,8 +374,37 @@ class EvolutionCoordinator:
             )
             self.active_fitness_calc = fc
             base_chromosome = list(self.state.overall_best_chromosome or [])
+            disp_name = translate_layer_name(ch_data["name"], lang)
+            if layer_max_lines == 0:
+                self.queues["status_queue"].put({
+                    "type": "island_update",
+                    "run_id": run_id,
+                    "data": {"id": 0, "chromosome": [], "fitness": fc.empty_fitness, "mut_stats": {}, "layer_idx": active_idx},
+                })
+                self.queues["status_queue"].put({
+                    "type": "done",
+                    "run_id": run_id,
+                    "data": tr("st_layer_no_threads", lang, name=disp_name),
+                })
+                return
+
+            if len(base_chromosome) < 2:
+                base_chromosome, _, _, _ = optimize_thread_count_delta(
+                    [], fc, layer_max_lines, radon_guide=self.radon_guide, allow_add=True
+                )
+                if len(base_chromosome) < 2:
+                    self.queues["status_queue"].put({
+                        "type": "done",
+                        "run_id": run_id,
+                        "data": tr("st_layer_opt_empty", lang, name=disp_name),
+                    })
+                    return
+
             self.state.omp_baseline_fitness = fc.calculate_single_fitness(base_chromosome)
-            self._send_status(f"Запуск {config['num_islands']} параллельных островов эволюции...", run_id=run_id)
+            self._send_status(
+                tr("st_start_islands", lang, n=config["num_islands"], max_l=layer_max_lines),
+                run_id=run_id,
+            )
             self.manager_thread = IslandManagerThread(
                 config,
                 self.queues,
@@ -348,6 +415,7 @@ class EvolutionCoordinator:
                 layer_name=ch_data["name"],
                 emit_done=True,
                 run_id=run_id,
+                max_lines=layer_max_lines,
             )
             self.manager_thread.start()
         except Exception:
@@ -355,7 +423,7 @@ class EvolutionCoordinator:
             self.queues["status_queue"].put({
                 "type": "error",
                 "run_id": run_id,
-                "data": f"Ошибка при доводке: {traceback.format_exc()}",
+                "data": f"{tr('dlg_error', lang)}: {traceback.format_exc()}",
             })
 
     def _ensure_canvas_manager(self, config: Dict[str, Any]) -> CanvasManager:
@@ -380,7 +448,7 @@ class EvolutionCoordinator:
 
     def start_generation(self) -> None:
         if self.state.original_image is None:
-            messagebox.showwarning("Внимание", "Пожалуйста, сначала загрузите изображение.")
+            messagebox.showwarning(self._t("dlg_warn"), self._t("msg_load_first"))
             return
         config = self.state.get_config()
         run_id = self._next_run_id()
@@ -399,8 +467,9 @@ class EvolutionCoordinator:
         t.start()
 
     def _prepare_and_run_evolution(self, config: Dict[str, Any], run_id: int) -> None:
+        lang = config.get("language", self.state.lang)
         try:
-            self._send_status("Анализ изображения, геометрии и построение таблиц хорд...", run_id=run_id)
+            self._send_status(tr("st_analyze", lang), run_id=run_id)
             bundle = prepare_target_image_bundle(
                 self.state.original_image,
                 IMAGE_SIZE,
@@ -420,7 +489,7 @@ class EvolutionCoordinator:
             radon_guide = None
             self.radon_guide = None
             if radon_enabled:
-                self._send_status("Вычисление томографической синограммы Радона (Ramp FBP)...", run_id=run_id)
+                self._send_status(tr("st_radon", lang), run_id=run_id)
                 primary_density = None if is_cmyk else channels[0]["darkness"]
                 radon_guide = RadonGuide(
                     bundle["gray"],
@@ -449,6 +518,8 @@ class EvolutionCoordinator:
             if not is_cmyk:
                 ch = channels[0]
                 ch_edges = ch.get("edges", bundle["edges"])
+                max_lines = int(config["lines"])
+                disp_ch = translate_layer_name(ch["name"], lang)
                 fc = FitnessCalculator(
                     bundle["gray"],
                     ch_edges,
@@ -460,7 +531,7 @@ class EvolutionCoordinator:
                     target_darkness_override=ch["darkness"],
                 )
                 self.active_fitness_calc = fc
-                self._send_status(f"Этап 1: Высокоточный CSR OMP-синтез ({ch['name']})...", run_id=run_id)
+                self._send_status(tr("st_omp_start", lang, name=disp_ch, max_l=max_lines), run_id=run_id)
                 greedy = GreedyInitializer(
                     cm,
                     fc.target_darkness_flat,
@@ -471,26 +542,29 @@ class EvolutionCoordinator:
                 )
 
                 def greedy_cb(status: str, path: List[int]) -> None:
-                    layers_snap = [{"name": ch["name"], "color_hex": ch["color_hex"], "path": path}]
+                    layers_snap = [{"name": ch["name"], "color_hex": ch["color_hex"], "path": path, "ref_lines": max_lines}]
                     self.queues["status_queue"].put({
                         "type": "greedy_update",
                         "run_id": run_id,
                         "data": {"text": status, "layers": layers_snap, "active_idx": 0},
                     })
 
-                base_chromosome = greedy.run(config["lines"], greedy_cb, layer_label=ch["name"])
+                base_chromosome = greedy.run(max_lines, greedy_cb, layer_label=ch["name"], line_alpha=fc.line_alpha)
                 if not base_chromosome or len(base_chromosome) < 2:
+                    self.state.layers = [{"name": ch["name"], "color_hex": ch["color_hex"], "path": [], "ref_lines": max_lines}]
                     self.queues["status_queue"].put({
-                        "type": "error",
+                        "type": "done",
                         "run_id": run_id,
-                        "data": "Не удалось построить начальный путь.",
+                        "data": tr("st_no_signal", lang),
                     })
                     return
 
-                self.state.layers = [{"name": ch["name"], "color_hex": ch["color_hex"], "path": list(base_chromosome)}]
+                self.state.layers = [
+                    {"name": ch["name"], "color_hex": ch["color_hex"], "path": list(base_chromosome), "ref_lines": max_lines}
+                ]
                 omp_fit, diff_map, depth_2d = fc.calculate_single_fitness_and_maps(base_chromosome)
                 self.state.omp_baseline_fitness = omp_fit
-                self.state.layer_best_fitnesses[0] = omp_fit
+                self.state.layer_best_fitnesses[0] = omp_fit - 1e-6
                 self.queues["status_queue"].put({
                     "type": "island_update",
                     "run_id": run_id,
@@ -499,7 +573,7 @@ class EvolutionCoordinator:
                 self._push_analytic_maps(diff_map, depth_2d)
 
                 if self.omp_stop_flag:
-                    self.queues["status_queue"].put({"type": "done", "run_id": run_id, "data": "Остановлено на этапе OMP."})
+                    self.queues["status_queue"].put({"type": "done", "run_id": run_id, "data": tr("st_stopped_omp", lang)})
                     return
 
                 self.manager_thread = IslandManagerThread(
@@ -512,13 +586,44 @@ class EvolutionCoordinator:
                     layer_name=ch["name"],
                     emit_done=True,
                     run_id=run_id,
+                    max_lines=max_lines,
                 )
                 self.manager_thread.start()
             else:
-                # 4-слойный цветной CMYK синтез с индивидуальными контурами и синограммами Радона по каналам
+                # 4-слойный CMYK синтез с индивидуальным первоначальным расчетом бюджета нитей на каждый цвет
+                max_lines = int(config["lines"])
+                ch_budgets = [
+                    estimate_channel_line_budget(ch["darkness"], bundle["mask"], cm, max_lines, config["line_weight"])
+                    for ch in channels
+                ]
+                budget_info = ", ".join(f"{layer_short_code(c['name'], lang)}≤{b}" for c, b in zip(channels, ch_budgets))
+                logging.info(f"Индивидуальные бюджеты CMYK (макс. {max_lines}): {budget_info}")
+                self._send_status(tr("st_cmyk_budgets", lang, info=budget_info), run_id=run_id)
+
                 for c_idx, ch in enumerate(channels):
                     if self.omp_stop_flag:
                         break
+                    disp_ch = translate_layer_name(ch["name"], lang)
+                    ch_budget = ch_budgets[c_idx]
+                    if ch_budget == 0:
+                        logging.info(f"CMYK слой {c_idx + 1}/4 ({ch['name']}): цвет отсутствует — 0 нитей (пропуск).")
+                        accumulated_layers.append({
+                            "name": ch["name"],
+                            "color_hex": ch["color_hex"],
+                            "path": [],
+                            "ref_lines": max_lines,
+                        })
+                        self.queues["status_queue"].put({
+                            "type": "greedy_update",
+                            "run_id": run_id,
+                            "data": {
+                                "text": tr("st_cmyk_absent", lang, idx=c_idx + 1, name=disp_ch),
+                                "layers": list(accumulated_layers),
+                                "active_idx": c_idx,
+                            },
+                        })
+                        continue
+
                     ch_edges = ch.get("edges", bundle["edges"])
                     ch_radon = (
                         RadonGuide(
@@ -543,7 +648,7 @@ class EvolutionCoordinator:
                         target_darkness_override=ch["darkness"],
                     )
                     self.active_fitness_calc = fc
-                    self._send_status(f"CMYK слой {c_idx + 1}/4 ({ch['name']}): CSR OMP-синтез...", run_id=run_id)
+                    self._send_status(tr("st_cmyk_omp", lang, idx=c_idx + 1, name=disp_ch, bud=ch_budget), run_id=run_id)
                     greedy = GreedyInitializer(
                         cm,
                         fc.target_darkness_flat,
@@ -553,28 +658,33 @@ class EvolutionCoordinator:
                         stop_Check=self._check_omp_stop_or_pause,
                     )
 
-                    def greedy_cb_cmyk(status: str, path: List[int], idx=c_idx, ch_meta=ch) -> None:
+                    def greedy_cb_cmyk(status: str, path: List[int], idx=c_idx, ch_meta=ch, d_name=disp_ch) -> None:
                         snap = list(accumulated_layers)
-                        snap.append({"name": ch_meta["name"], "color_hex": ch_meta["color_hex"], "path": path})
+                        snap.append({
+                            "name": ch_meta["name"],
+                            "color_hex": ch_meta["color_hex"],
+                            "path": path,
+                            "ref_lines": max_lines,
+                        })
                         self.queues["status_queue"].put({
                             "type": "greedy_update",
                             "run_id": run_id,
-                            "data": {"text": f"Слой {idx + 1}/4 ({ch_meta['name']}): {status}", "layers": snap, "active_idx": idx},
+                            "data": {"text": tr("st_cmyk_layer_prog", lang, idx=idx + 1, name=d_name, status=status), "layers": snap, "active_idx": idx},
                         })
 
-                    base_path = greedy.run(config["lines"], greedy_cb_cmyk, layer_label=ch["name"])
+                    base_path = greedy.run(ch_budget, greedy_cb_cmyk, layer_label=ch["name"], line_alpha=fc.line_alpha)
                     if len(base_path) >= 2 and not self.omp_stop_flag:
                         omp_layer_fit = fc.calculate_single_fitness(base_path)
                         self.state.omp_baseline_fitness = omp_layer_fit
                         self.state.layer_best_fitnesses[c_idx] = omp_layer_fit - 1e-6
                         snap_pre = list(accumulated_layers) + [
-                            {"name": ch["name"], "color_hex": ch["color_hex"], "path": list(base_path)}
+                            {"name": ch["name"], "color_hex": ch["color_hex"], "path": list(base_path), "ref_lines": max_lines}
                         ]
                         self.queues["status_queue"].put({
                             "type": "greedy_update",
                             "run_id": run_id,
                             "data": {
-                                "text": f"Слой {c_idx + 1}/4 ({ch['name']}): эволюционная доводка...",
+                                "text": tr("st_cmyk_polish", lang, idx=c_idx + 1, name=disp_ch, lines=len(base_path) - 1),
                                 "layers": snap_pre,
                                 "active_idx": c_idx,
                             },
@@ -592,21 +702,28 @@ class EvolutionCoordinator:
                             stages_override=cmyk_stages,
                             patience_scale=0.55,
                             run_id=run_id,
+                            max_lines=ch_budget,
                         )
                         self.manager_thread = mgr
                         mgr.start()
                         mgr.join()
-                        if mgr.best_result and len(mgr.best_result.get("chromosome", [])) >= 2:
-                            base_path = list(mgr.best_result["chromosome"])
+                        if mgr.best_result is not None:
+                            base_path = list(mgr.best_result.get("chromosome", []))
 
-                    accumulated_layers.append({"name": ch["name"], "color_hex": ch["color_hex"], "path": base_path})
+                    accumulated_layers.append({
+                        "name": ch["name"],
+                        "color_hex": ch["color_hex"],
+                        "path": base_path,
+                        "ref_lines": max_lines,
+                    })
+                    n_done = max(0, len(base_path) - 1)
                     self.queues["status_queue"].put({
                         "type": "greedy_update",
                         "run_id": run_id,
-                        "data": {"text": f"Слой {ch['name']} готов", "layers": list(accumulated_layers), "active_idx": c_idx},
+                        "data": {"text": tr("st_cmyk_layer_done", lang, name=disp_ch, lines=n_done), "layers": list(accumulated_layers), "active_idx": c_idx},
                     })
 
-                msg = "Остановлено пользователем." if self.omp_stop_flag else "Цветной CMYK синтез и полировка завершены!"
+                msg = tr("st_stopped_user", lang) if self.omp_stop_flag else tr("st_cmyk_done", lang)
                 self.queues["status_queue"].put({"type": "done", "run_id": run_id, "data": msg})
 
         except Exception:
@@ -614,7 +731,7 @@ class EvolutionCoordinator:
             self.queues["status_queue"].put({
                 "type": "error",
                 "run_id": run_id,
-                "data": f"Ошибка при подготовке: {traceback.format_exc()}",
+                "data": f"{tr('dlg_error', lang)}: {traceback.format_exc()}",
             })
 
     def _check_omp_stop_or_pause(self) -> bool:
@@ -656,7 +773,7 @@ class EvolutionCoordinator:
         self._cancel_stats_job()
         if self.manager_thread and self.manager_thread.is_alive():
             self.manager_thread.stop()
-        self._send_status("Остановка потоков...", run_id=run_id)
+        self._send_status(self._t("st_stopping"), run_id=run_id)
         deadline = time.monotonic() + 2.5
         self.root.after(120, lambda: self._wait_for_stop(run_id, deadline))
 
@@ -682,13 +799,13 @@ class EvolutionCoordinator:
             self.omp_pause_event.clear()
             if self.manager_thread and self.manager_thread.is_alive():
                 self.manager_thread.pause()
-            self.ui_manager.widgets["pause_button"].config(text="► Продолжить")
-            self._send_status("Пауза...", run_id=self._run_id)
+            self.ui_manager.widgets["pause_button"].config(text=self._t("btn_resume"))
+            self._send_status(self._t("st_paused"), run_id=self._run_id)
         else:
             self.omp_pause_event.set()
             if self.manager_thread and self.manager_thread.is_alive():
                 self.manager_thread.resume()
-            self.ui_manager.widgets["pause_button"].config(text="❚❚ Пауза")
+            self.ui_manager.widgets["pause_button"].config(text=self._t("btn_pause"))
             self.stats_update_job = self.root.after(1000, self._update_progress_stats)
 
     def process_queues(self) -> None:
@@ -762,13 +879,14 @@ class EvolutionCoordinator:
 
     def _handle_error(self, data: str) -> None:
         self._cancel_stats_job()
-        messagebox.showerror("Ошибка", data)
-        self.ui_manager.widgets["status_label"].config(text="Ошибка!")
+        messagebox.showerror(self._t("dlg_error"), data)
+        self.ui_manager.widgets["status_label"].config(text=self._t("st_error"))
         self.ui_manager.toggle_ui_state(False)
 
     def _handle_gpu_status(self, data: bool) -> None:
+        self.ui_manager._last_gpu_flag = bool(data)
         mode = f"PyTorch CUDA ({CUDA_DEVICE_NAME}) + CSR" if data else "SciPy CSR + NumPy (CPU)"
-        self.ui_manager.widgets["compute_mode_label"].config(text=f"Ядро: {mode}")
+        self.ui_manager.widgets["compute_mode_label"].config(text=self._t("engine_label", mode=mode))
 
     def _handle_generation_tick(self, data: Tuple[int, int, int, int]) -> None:
         island_id, stage, patience, limit = data
@@ -801,7 +919,7 @@ class EvolutionCoordinator:
         if sel and notebook.index(sel) == island_id + 1:
             self.request_canvas_update(island_id, (chromosome, config["pins"], config["thread_thickness"]), {})
 
-        if fitness > self.state.layer_best_fitnesses.get(layer_idx, -1.0):
+        if data.get("force_update") or fitness > self.state.layer_best_fitnesses.get(layer_idx, -1.0):
             self.state.layer_best_fitnesses[layer_idx] = fitness
             self.state.overall_best_fitness = fitness
             self.state.overall_best_chromosome = list(chromosome)
@@ -868,10 +986,32 @@ class EvolutionCoordinator:
 
     def _handle_done(self, data: str) -> None:
         removed = self.prune_chromosome(silent=True)
+        # Если активный слой оказался пустым (например, отсутствующий цвет CMYK), переключаемся на последний непустой
+        if self.state.layers:
+            cur_idx = min(self.state.active_layer_idx, len(self.state.layers) - 1)
+            if len(self.state.layers[cur_idx].get("path", [])) < 2:
+                non_empty = [i for i, l in enumerate(self.state.layers) if len(l.get("path", [])) >= 2]
+                if non_empty:
+                    self.state.active_layer_idx = non_empty[-1]
+                    active_p = self.state.layers[self.state.active_layer_idx]["path"]
+                    self.state.overall_best_chromosome = list(active_p)
+                    max_steps = max(1, len(active_p) - 1)
+                    scale = self.ui_manager.widgets.get("step_scrubber_scale")
+                    if isinstance(scale, ttk.Scale):
+                        scale.configure(to=max(10, max_steps))
+                    self.state.vars["step_scrubber"].set(max_steps)
+
         self._finalize_run()
         self.ui_manager.update_layer_selector()
         total_lines = sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers)
-        msg = f"{data} (Нитей: {total_lines}, удалено петель: {removed})"
+        if len(self.state.layers) > 1:
+            per_layer = " ".join(
+                f"{layer_short_code(str(l.get('name', 'L')), self.state.lang)}:{max(0, len(l.get('path', [])) - 1)}"
+                for l in self.state.layers
+            )
+            msg = self._t("st_done_cmyk_fmt", msg=data, per_layer=per_layer, total=total_lines)
+        else:
+            msg = self._t("st_done_mono_fmt", msg=data, total=total_lines, rem=removed)
         self.ui_manager.widgets["status_label"].config(text=msg)
         self.ui_manager.update_player_step_label()
 
@@ -887,14 +1027,14 @@ class EvolutionCoordinator:
     def _handle_export_png_done(self, filepath: str) -> None:
         if "export_png_button" in self.ui_manager.widgets and not self.state.is_running:
             self.ui_manager.widgets["export_png_button"].config(state=tk.NORMAL)
-        self.ui_manager.widgets["status_label"].config(text="Экспорт PNG 2400x2400 завершен.")
-        messagebox.showinfo("Экспорт PNG", f"Изображение высокого разрешения сохранено в:\n{filepath}")
+        self.ui_manager.widgets["status_label"].config(text=self._t("msg_exp_png_done_status"))
+        messagebox.showinfo("PNG", self._t("msg_exp_png_ok", path=filepath))
 
     def _handle_export_png_error(self, err_msg: str) -> None:
         if "export_png_button" in self.ui_manager.widgets and not self.state.is_running:
             self.ui_manager.widgets["export_png_button"].config(state=tk.NORMAL)
-        self.ui_manager.widgets["status_label"].config(text="Ошибка экспорта PNG.")
-        messagebox.showerror("Ошибка экспорта PNG", f"Не удалось сохранить Ultra-HD PNG:\n{err_msg}")
+        self.ui_manager.widgets["status_label"].config(text=self._t("msg_exp_png_err_status"))
+        messagebox.showerror(self._t("dlg_error"), self._t("msg_exp_png_err", err=err_msg))
 
     def _send_status(self, message: str, run_id: int = 0) -> None:
         self.queues["status_queue"].put({"type": "status", "run_id": run_id, "data": message})
@@ -933,7 +1073,51 @@ class EvolutionCoordinator:
             return 0
 
         total_removed = 0
-        if self.state.layers:
+        total_added = 0
+
+        if not silent and self.state.original_image is not None and self.state.layers:
+            # Ручной запуск: удаляем петли + избыточные перетемняющие нити через точный O(L) дельта-анализ
+            config = self.state.get_config()
+            cm = self._ensure_canvas_manager(config)
+            bundle = prepare_target_image_bundle(
+                self.state.original_image,
+                IMAGE_SIZE,
+                clahe_clip=config["clahe_clip"],
+                gamma=config["gamma"],
+                shape=config["canvas_shape"],
+                color_mode=config["color_mode"],
+            )
+            channels = bundle["channels"]
+            for l_idx, layer in enumerate(self.state.layers):
+                path = layer.get("path", [])
+                if l_idx < len(channels):
+                    ch = channels[l_idx]
+                    fc = FitnessCalculator(
+                        bundle["gray"],
+                        ch.get("edges", bundle["edges"]),
+                        bundle["saliency"],
+                        ch["importance"],
+                        cm,
+                        config,
+                        self.queues,
+                        target_darkness_override=ch["darkness"],
+                    )
+                    max_l = (
+                        estimate_channel_line_budget(ch["darkness"], bundle["mask"], cm, config["lines"], config["line_weight"])
+                        if len(channels) > 1
+                        else int(config["lines"])
+                    )
+                    opt_p, _, rem, add = optimize_thread_count_delta(path, fc, max_l, allow_add=False)
+                    layer["path"] = opt_p
+                    total_removed += rem
+                    total_added += add
+                else:
+                    pruned, rem = prune_chromosome_loops(path)
+                    layer["path"] = pruned
+                    total_removed += rem
+                if l_idx == self.state.active_layer_idx:
+                    self.state.overall_best_chromosome = layer["path"]
+        elif self.state.layers:
             for l_idx, layer in enumerate(self.state.layers):
                 pruned, rem = prune_chromosome_loops(layer.get("path", []))
                 layer["path"] = pruned
@@ -944,7 +1128,7 @@ class EvolutionCoordinator:
             pruned, total_removed = prune_chromosome_loops(self.state.overall_best_chromosome)
             self.state.overall_best_chromosome = pruned
 
-        if total_removed > 0:
+        if total_removed > 0 or total_added > 0:
             active_path = self.state.overall_best_chromosome or []
             max_steps = max(1, len(active_path) - 1)
             scale = self.ui_manager.widgets.get("step_scrubber_scale")
@@ -968,21 +1152,21 @@ class EvolutionCoordinator:
             if not silent:
                 total_lines = sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers)
                 messagebox.showinfo(
-                    "Оптимизация пути",
-                    f"Удалено холостых возвратных петель: {total_removed}\nИтого четких нитей: {total_lines}",
+                    self._t("msg_prune_title"),
+                    self._t("msg_prune_done", rem=total_removed, total=total_lines),
                 )
         elif not silent:
-            messagebox.showinfo("Оптимизация пути", "Холостых петель не обнаружено, путь уже оптимален!")
+            messagebox.showinfo(self._t("msg_prune_title"), self._t("msg_prune_clean"))
         return total_removed
 
     def save_project(self) -> None:
         if not self.state.layers and not self.state.overall_best_chromosome:
-            messagebox.showwarning("Сохранение проекта", "Сначала выполните синтез картины.")
+            messagebox.showwarning(self._t("msg_save_proj_title"), self._t("msg_synth_first"))
             return
         filepath = filedialog.asksaveasfilename(
             defaultextension=".sart.json",
             filetypes=[("String Art Studio Project", "*.sart.json"), ("JSON files", "*.json")],
-            title="Сохранить проект String Art Studio",
+            title=self._t("msg_save_proj_dlg"),
         )
         if not filepath:
             return
@@ -995,36 +1179,47 @@ class EvolutionCoordinator:
                 step_scrubber=int(self.state.safe_get("step_scrubber") or 1),
                 image_path=self.state.original_image_path,
             )
-            self.ui_manager.widgets["status_label"].config(text=f"Проект сохранен: {os.path.basename(filepath)}")
-            messagebox.showinfo("Проект сохранен", f"Проект успешно сохранен:\n{filepath}")
+            self.ui_manager.widgets["status_label"].config(
+                text=self._t("msg_proj_saved_status", name=os.path.basename(filepath))
+            )
+            messagebox.showinfo(self._t("msg_save_proj_title"), self._t("msg_save_proj_ok", path=filepath))
         except Exception as exc:
             logging.error("Не удалось сохранить проект", exc_info=True)
-            messagebox.showerror("Ошибка сохранения", f"Не удалось сохранить проект:\n{exc}")
+            messagebox.showerror(self._t("dlg_error"), self._t("msg_save_proj_err", err=exc))
 
     def load_project(self) -> None:
         if self.state.is_running:
-            messagebox.showwarning("Загрузка проекта", "Остановите текущую генерацию перед загрузкой проекта.")
+            messagebox.showwarning(self._t("msg_load_proj_title"), self._t("msg_load_proj_stop"))
             return
         filepath = filedialog.askopenfilename(
             filetypes=[("String Art Studio Project", "*.sart.json *.json"), ("All files", "*.*")],
-            title="Открыть проект String Art Studio",
+            title=self._t("msg_load_proj_dlg"),
         )
         if not filepath:
             return
         try:
             proj = load_project_json(filepath)
             self.apply_loaded_project(proj, source_path=filepath)
-            messagebox.showinfo("Проект загружен", f"Проект успешно открыт:\n{filepath}")
+            messagebox.showinfo(self._t("msg_load_proj_title"), self._t("msg_load_proj_ok", path=filepath))
         except Exception as exc:
             logging.error("Не удалось открыть проект", exc_info=True)
-            messagebox.showerror("Ошибка загрузки", f"Не удалось открыть проект:\n{exc}")
+            messagebox.showerror(self._t("dlg_error"), self._t("msg_load_proj_err", err=exc))
 
     def apply_loaded_project(self, proj: Dict[str, Any], source_path: Optional[str] = None) -> None:
         """Восстанавливает состояние приложения, холст и плеер из загруженного словаря проекта."""
         cfg = proj.get("config", {})
+        lang = self.state.lang
         for k, v in cfg.items():
-            if k in self.state.vars:
+            if k in self.state.vars and k != "language":
                 try:
+                    if k == "canvas_shape":
+                        v = to_display_shape(str(v), lang)
+                    elif k == "color_mode":
+                        v = to_display_color_mode(str(v), lang)
+                    elif k == "structural_metric":
+                        v = to_display_metric(str(v), lang)
+                    elif k == "preset":
+                        v = to_display_preset(str(v), lang)
                     self.state.vars[k].set(v)
                 except (tk.TclError, ValueError):
                     pass
@@ -1034,6 +1229,7 @@ class EvolutionCoordinator:
                 "name": str(l.get("name", f"Слой {i + 1}")),
                 "color_hex": str(l.get("color_hex", "#111111")),
                 "path": [int(p) for p in l.get("path", [])],
+                **({"ref_lines": int(l["ref_lines"])} if "ref_lines" in l else {}),
             }
             for i, l in enumerate(proj["layers"])
         ]
@@ -1081,7 +1277,10 @@ class EvolutionCoordinator:
         self.ui_manager.update_thread_length_display(total_m)
         self.ui_manager.toggle_ui_state(False)
         self.ui_manager.widgets["status_label"].config(
-            text=f"Проект загружен ({sum(max(0, len(l['path']) - 1) for l in self.state.layers)} нитей)."
+            text=self._t(
+                "msg_proj_loaded_status",
+                lines=sum(max(0, len(l["path"]) - 1) for l in self.state.layers),
+            )
         )
         self.request_canvas_update(
             "overall",
@@ -1091,7 +1290,7 @@ class EvolutionCoordinator:
 
     def _get_export_cm(self) -> Optional[CanvasManager]:
         if not self.state.layers and not self.state.overall_best_chromosome:
-            messagebox.showwarning("Внимание", "Сначала выполните синтез картины.")
+            messagebox.showwarning(self._t("dlg_warn"), self._t("msg_synth_first"))
             return None
         config = self.state.get_config()
         if (
@@ -1122,8 +1321,8 @@ class EvolutionCoordinator:
         filepath = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files", "*.txt")])
         if not filepath:
             return
-        export_instructions_txt(filepath, self._get_export_layers(), cm)
-        messagebox.showinfo("Экспорт TXT", f"Схема гвоздей успешно сохранена:\n{filepath}")
+        export_instructions_txt(filepath, self._get_export_layers(), cm, lang=self.state.lang)
+        messagebox.showinfo("TXT", self._t("msg_exp_txt_ok", path=filepath))
 
     def export_csv(self) -> None:
         cm = self._get_export_cm()
@@ -1132,8 +1331,8 @@ class EvolutionCoordinator:
         filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
         if not filepath:
             return
-        export_csv(filepath, self._get_export_layers(), cm)
-        messagebox.showinfo("Экспорт CSV", f"Таблица переходов CSV сохранена:\n{filepath}")
+        export_csv(filepath, self._get_export_layers(), cm, lang=self.state.lang)
+        messagebox.showinfo("CSV", self._t("msg_exp_csv_ok", path=filepath))
 
     def export_gcode(self) -> None:
         cm = self._get_export_cm()
@@ -1143,7 +1342,7 @@ class EvolutionCoordinator:
         if not filepath:
             return
         export_gcode_cnc(filepath, self._get_export_layers(), cm)
-        messagebox.showinfo("Экспорт G-Code", f"ЧПУ-программа G-Code сохранена:\n{filepath}")
+        messagebox.showinfo("G-Code", self._t("msg_exp_gcode_ok", path=filepath))
 
     def export_png(self) -> None:
         cm = self._get_export_cm()
@@ -1157,7 +1356,7 @@ class EvolutionCoordinator:
         invert_board = self.state.is_invert_board()
         if "export_png_button" in self.ui_manager.widgets:
             self.ui_manager.widgets["export_png_button"].config(state=tk.DISABLED)
-        self.ui_manager.widgets["status_label"].config(text="Экспорт Ultra HD PNG (2400x2400px) в фоне...")
+        self.ui_manager.widgets["status_label"].config(text=self._t("msg_exp_png_bg"))
 
         def _worker() -> None:
             try:
@@ -1192,7 +1391,7 @@ class EvolutionCoordinator:
             thread_thickness=config["thread_thickness"],
             invert_board=self.state.is_invert_board(),
         )
-        messagebox.showinfo("Экспорт SVG", f"Векторный файл SVG успешно сохранен:\n{filepath}")
+        messagebox.showinfo("SVG", self._t("msg_exp_svg_ok", path=filepath))
 
     def export_template(self) -> None:
         config = self.state.get_config()
@@ -1203,8 +1402,8 @@ class EvolutionCoordinator:
         filepath = filedialog.asksaveasfilename(defaultextension=".svg", filetypes=[("Drill Template SVG", "*.svg")])
         if not filepath:
             return
-        export_drill_template_svg(filepath, cm)
-        messagebox.showinfo("Шаблон 1:1", f"Чертеж сверления гвоздей 1:1 (в мм) сохранен:\n{filepath}")
+        export_drill_template_svg(filepath, cm, lang=self.state.lang)
+        messagebox.showinfo("1:1 SVG", self._t("msg_exp_tpl_ok", path=filepath))
 
     def export_html(self) -> None:
         cm = self._get_export_cm()
@@ -1213,7 +1412,7 @@ class EvolutionCoordinator:
         filepath = filedialog.asksaveasfilename(
             defaultextension=".html",
             filetypes=[("HTML5 Web Assistant", "*.html")],
-            title="Сохранить автономный веб-ассистент плетения",
+            title=self._t("msg_exp_html_dlg"),
         )
         if not filepath:
             return
@@ -1227,11 +1426,8 @@ class EvolutionCoordinator:
                 cm,
                 self._get_export_layers(),
                 invert_board=self.state.is_invert_board(),
+                lang=self.state.lang,
             )
-            messagebox.showinfo(
-                "Успех",
-                f"Автономный веб-ассистент успешно сохранен в:\n{filepath}\n\n"
-                "Откройте файл в любом браузере на ПК, планшете или смартфоне!",
-            )
+            messagebox.showinfo(self._t("dlg_success"), self._t("msg_exp_html_ok", path=filepath))
         except Exception as exc:
-            messagebox.showerror("Ошибка", f"Не удалось экспортировать HTML:\n{exc}")
+            messagebox.showerror(self._t("dlg_error"), self._t("msg_exp_html_err", err=exc))

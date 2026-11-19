@@ -140,6 +140,42 @@ class TestExporters(unittest.TestCase):
         html_c = build_interactive_html5_assistant("Circle", cm_circle, layers[:1])
         self.assertIn("border-radius: 50%;", html_c)
 
+    def test_english_exporters(self):
+        cm = CanvasManager(size=500, num_pins=120, shape="Circle", physical_cm=45.0)
+        layers = [
+            {"name": "Циан (Cyan)", "color_hex": "#00a8e8", "path": []},
+            {"name": "Маджента (Magenta)", "color_hex": "#e6007a", "path": [0, 35, 70, 105, 15]},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            txt_p = os.path.join(tmp, "en.txt")
+            csv_p = os.path.join(tmp, "en.csv")
+            tpl_p = os.path.join(tmp, "en_tpl.svg")
+
+            export_instructions_txt(txt_p, layers, cm, lang="en")
+            with open(txt_p, encoding="utf-8") as f:
+                txt_data = f.read()
+            self.assertIn("LAYER 1: Cyan", txt_data)
+            self.assertIn("Threads in layer: 0", txt_data)
+            self.assertIn("LAYER 2: Magenta", txt_data)
+            self.assertIn("TOTAL THREAD LENGTH", txt_data)
+
+            export_csv(csv_p, layers, cm, lang="en")
+            with open(csv_p, encoding="utf-8-sig") as f:
+                self.assertIn("Layer,Color,Step,From_Pin,To_Pin,Length_m", f.readline())
+
+            export_drill_template_svg(tpl_p, cm, lang="en")
+            with open(tpl_p, encoding="utf-8") as f:
+                tpl_data = f.read()
+            self.assertIn("1:1 scale check", tpl_data)
+            self.assertIn("Circle", tpl_data)
+
+            html_en = build_interactive_html5_assistant("English Art", cm, layers, lang="en")
+            self.assertIn('<html lang="en">', html_en)
+            self.assertIn("en-US", html_en)
+            self.assertIn("Weaving Assistant", html_en)
+            self.assertNotIn('"Cyan"', html_en)  # 0-thread layer omitted from interactive player
+            self.assertIn("Magenta", html_en)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,7 @@ import numpy as np
 from PIL import Image
 
 from .geometry import CanvasManager
+from .i18n import tr
 
 
 def _composite_onto_bg(pil_img: Image.Image, bg_rgb: Tuple[int, int, int] = (255, 255, 255)) -> Image.Image:
@@ -60,7 +61,12 @@ def _fit_image_to_frame(
 
 
 def _is_dark_board_mode(color_mode: str) -> bool:
-    return "Белая нить" in color_mode or "Темная" in color_mode
+    return (
+        "Белая нить" in color_mode
+        or "Темная" in color_mode
+        or "White Thread" in color_mode
+        or "Dark Board" in color_mode
+    )
 
 
 def prepare_target_image_bundle(
@@ -179,11 +185,13 @@ def prepare_target_image_bundle(
 
 def _compute_channel_edges_and_importance(
     ch_density: np.ndarray,
-    base_importance: np.ndarray,
     mask: np.ndarray,
     boost: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Строит индивидуальную карту контуров Собеля и значимости для отдельного CMYK-канала."""
+    """
+    Строит индивидуальную карту контуров Собеля и значимости для отдельного CMYK-канала.
+    Не переносит чужие контуры других цветов на пустые зоны текущего канала.
+    """
     blur = cv2.GaussianBlur(ch_density.astype(np.float32), (3, 3), 0)
     gx = cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3)
@@ -196,7 +204,9 @@ def _compute_channel_edges_and_importance(
         grad_norm = np.zeros_like(ch_density, dtype=np.float32)
 
     ch_edges = (grad_norm * 255.0).astype(np.uint8)
-    ch_imp = (0.55 * base_importance + 0.45 * (grad_norm * 3.5 + 0.6)) * float(boost)
+    # Высокий приоритет в зонах присутствия данного цвета и на его собственных контурах;
+    # ровный базовый вес (0.60) на фоне гарантирует защиту от паразитных нитей.
+    ch_imp = (0.60 + ch_density.astype(np.float32) * 1.40 + grad_norm * 3.0) * float(boost)
     ch_imp = np.where(mask == 255, ch_imp, 0.15).astype(np.float32)
     return ch_edges, ch_imp
 
@@ -262,10 +272,10 @@ def extract_channels(
         ch_arr[mask == 0] = 0.0
         ch_arr[ch_arr < 0.06] = 0.0
 
-    c_edges, c_imp = _compute_channel_edges_and_importance(c, importance, mask, boost=1.0)
-    m_edges, m_imp = _compute_channel_edges_and_importance(m, importance, mask, boost=1.0)
-    y_edges, y_imp = _compute_channel_edges_and_importance(y, importance, mask, boost=1.0)
-    k_edges, k_imp = _compute_channel_edges_and_importance(k, importance, mask, boost=1.15)
+    c_edges, c_imp = _compute_channel_edges_and_importance(c, mask, boost=1.0)
+    m_edges, m_imp = _compute_channel_edges_and_importance(m, mask, boost=1.0)
+    y_edges, y_imp = _compute_channel_edges_and_importance(y, mask, boost=1.0)
+    k_edges, k_imp = _compute_channel_edges_and_importance(k, mask, boost=1.15)
 
     return [
         {"name": "Циан (Cyan)", "color_hex": "#00a8e8", "darkness": c.astype(np.float32), "importance": c_imp, "edges": c_edges},
@@ -294,7 +304,9 @@ def prepare_target_image(
     return bundle["gray"], bundle["edges"], bundle["saliency"], bundle["importance"]
 
 
-def auto_recommend_parameters(original_image: Image.Image, shape: str = "Круг") -> Dict[str, Any]:
+def auto_recommend_parameters(
+    original_image: Image.Image, shape: str = "Круг", lang: str = "ru"
+) -> Dict[str, Any]:
     """
     Интеллектуальный расчет параметров под изображение для четкого плетения без "каши".
     """
@@ -334,9 +346,13 @@ def auto_recommend_parameters(original_image: Image.Image, shape: str = "Кру�
     radon_influence = int(np.clip(round(30 + complexity_score * 15), 20, 50))
     stages = 5 if recommended_lines <= 1500 else 6
 
-    summary = (
-        f"Детали: {int(complexity_score * 100)}% | Тень: {int(darkness_ratio * 100)}% → "
-        f"{recommended_pins} гвоздей, {recommended_lines} нитей"
+    summary = tr(
+        "auto_rec_summary",
+        lang,
+        comp=int(complexity_score * 100),
+        dark=int(darkness_ratio * 100),
+        pins=recommended_pins,
+        lines=recommended_lines,
     )
 
     return {

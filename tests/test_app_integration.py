@@ -11,7 +11,7 @@ from string_art_studio.ui import StringArtApp
 class TestAppIntegration(unittest.TestCase):
     def test_gui_full_lifecycle_monochrome_and_cmyk(self):
         try:
-            app = StringArtApp()
+            app = StringArtApp(lang="ru")
         except Exception as exc:
             self.skipTest(f"Tkinter display unavailable in environment: {exc}")
             return
@@ -93,10 +93,15 @@ class TestAppIntegration(unittest.TestCase):
             self.assertFalse(app.state.is_running)
             self.assertEqual(app.state.layers[0]["name"], "Белая нить")
 
-            # Тест полного 4-слойного CMYK цикла через GUI
+            # Тест полного 4-слойного CMYK цикла на КРАСНОМ изображении (Циан должен быть 0 нитей!)
+            red_img = Image.new("RGB", (400, 400), (255, 255, 255))
+            rdraw = ImageDraw.Draw(red_img)
+            rdraw.ellipse((65, 65, 335, 335), fill=(225, 28, 22))
+            rdraw.ellipse((135, 135, 265, 265), fill=(115, 12, 12))
+            app.state.original_image = red_img
             app.state.vars["color_mode"].set("Цветной CMYK (4 нити)")
             app.state.vars["pins"].set(120)
-            app.state.vars["lines"].set(60)
+            app.state.vars["lines"].set(120)
             app.state.vars["stages"].set(1)
             app.state.vars["num_islands"].set(1)
             app.state.vars["population_size"].set(4)
@@ -108,19 +113,30 @@ class TestAppIntegration(unittest.TestCase):
                 time.sleep(0.03)
             self.assertFalse(app.state.is_running, "CMYK синтез не завершился вовремя")
             self.assertEqual(len(app.state.layers), 4)
+            # На чисто красном изображении Циан обязан быть пустым (0 нитей), а Маджента и Желтый > 0
+            self.assertEqual(len(app.state.layers[0]["path"]), 0, "Циан не должен содержать нитей на красной картинке")
+            self.assertGreater(len(app.state.layers[1]["path"]), 10)
+            self.assertGreater(len(app.state.layers[2]["path"]), 10)
+            for lyr in app.state.layers:
+                self.assertLessEqual(max(0, len(lyr["path"]) - 1), 120)
 
-            # Тест экспорта HTML и сохранения/загрузки проекта (.sart.json) из UI состояния
+            # Тест экспорта HTML, TXT и сохранения/загрузки проекта (.sart.json) с пустым слоем Cyan
             with tempfile.TemporaryDirectory() as tmp:
                 out_html = os.path.join(tmp, "assistant.html")
+                out_txt = os.path.join(tmp, "scheme.txt")
                 proj_path = os.path.join(tmp, "project.sart.json")
                 from string_art_studio.exporters import (
                     export_html_assistant,
+                    export_instructions_txt,
                     load_project_json,
                     save_project_json,
                 )
 
                 export_html_assistant(out_html, "GUI Test", app.coordinator.canvas_manager, app.state.layers)
                 self.assertTrue(os.path.exists(out_html))
+                export_instructions_txt(out_txt, app.state.layers, app.coordinator.canvas_manager)
+                with open(out_txt, encoding="utf-8") as f:
+                    self.assertIn("Нитей в слое: 0", f.read())
 
                 save_project_json(
                     proj_path,
@@ -134,8 +150,27 @@ class TestAppIntegration(unittest.TestCase):
                 app.coordinator.apply_loaded_project(proj, source_path=proj_path)
                 app.update()
                 self.assertEqual(len(app.state.layers), 4)
+                self.assertEqual(len(app.state.layers[0]["path"]), 0)
                 self.assertEqual(app.state.active_layer_idx, 2)
                 self.assertEqual(int(app.state.safe_get("step_scrubber")), 10)
+
+            # Тест живого переключения языка RU -> EN -> RU без перезапуска
+            app.set_language("en", persist=False)
+            app.update()
+            self.assertEqual(app.state.lang, "en")
+            self.assertEqual(app.ui_manager.widgets["start_button"].cget("text"), "▶ Start (CSR OMP + Islands)")
+            self.assertEqual(app.state.vars["color_mode"].get(), "Color CMYK (4 Threads)")
+            self.assertEqual(app.state.vars["canvas_shape"].get(), "Circle")
+            cfg_en = app.state.get_config()
+            self.assertEqual(cfg_en["language"], "en")
+            self.assertEqual(cfg_en["color_mode"], "Цветной CMYK (4 нити)")
+            self.assertEqual(cfg_en["canvas_shape"], "Круг")
+
+            app.set_language("ru", persist=False)
+            app.update()
+            self.assertEqual(app.state.lang, "ru")
+            self.assertEqual(app.ui_manager.widgets["start_button"].cget("text"), "▶ Старт (CSR OMP + Острова)")
+            self.assertEqual(app.state.vars["color_mode"].get(), "Цветной CMYK (4 нити)")
         finally:
             app.coordinator.shutdown()
             app.audio_assistant.shutdown()
