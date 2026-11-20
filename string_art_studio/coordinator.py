@@ -752,44 +752,46 @@ class EvolutionCoordinator:
                 rgb_norm = np.clip(rgb_smooth.astype(np.float32) / 255.0, 0.0, 1.0)
                 h, w, _ = rgb_norm.shape
 
-                # Физическое оптическое поглощение (Beer-Lambert NNLS)
+                # Физическое оптическое цветоделение под выбранные нити (как в CMYK, но для произвольной палитры)
                 if not invert_board:
                     T = np.clip(1.0 - rgb_norm, 0.0, 1.0)
+                    gray_norm = 0.299 * rgb_norm[:, :, 0] + 0.587 * rgb_norm[:, :, 1] + 0.114 * rgb_norm[:, :, 2]
+                    darkness_total = np.clip(1.0 - gray_norm, 0.0, 1.0)
                     A_cols = [np.clip(1.0 - (np.array(c["rgb"], dtype=np.float32) / 255.0), 0.0, 1.0) for c in selected_colors]
+                    contrasts = [float(np.mean(a)) for a in A_cols]
                 else:
                     T = np.clip(rgb_norm, 0.0, 1.0)
+                    gray_norm = 0.299 * rgb_norm[:, :, 0] + 0.587 * rgb_norm[:, :, 1] + 0.114 * rgb_norm[:, :, 2]
+                    darkness_total = np.clip(gray_norm, 0.0, 1.0)
                     A_cols = [np.clip(np.array(c["rgb"], dtype=np.float32) / 255.0, 0.0, 1.0) for c in selected_colors]
+                    contrasts = [float(np.mean(a)) for a in A_cols]
 
-                A = np.column_stack(A_cols)  # (3, K)
-                T_flat = T.reshape(-1, 3)     # (N, 3)
+                darkness_total = np.where(mask == 255, darkness_total, 0.0)
+                T_norm = np.linalg.norm(T, axis=-1, keepdims=True) + 1e-6
+                T_dir = T / T_norm
 
-                # Точное решение NNLS через быстрый проективный градиент
-                AtA = (A.T @ A).astype(np.float32)
-                AtT = (T_flat @ A).astype(np.float32)
-                L_lip = float(np.linalg.norm(AtA, 2))
-                step_sz = 1.0 / max(1e-4, L_lip)
-
-                d_mat = np.zeros((len(T_flat), len(selected_colors)), dtype=np.float32)
-                for _ in range(16):
-                    grad = d_mat @ AtA - AtT
-                    d_mat = np.maximum(0.0, d_mat - step_sz * grad)
-
-                d_2d = d_mat.reshape(h, w, len(selected_colors))
-
-                # Подавление краевых и фоновых шумов
-                for k_i in range(len(selected_colors)):
-                    ch_arr = d_2d[:, :, k_i]
-                    ch_arr[mask == 0] = 0.0
-                    ch_arr[ch_arr < 0.05] = 0.0
+                channel_densities = []
+                for k_i, a in enumerate(A_cols):
+                    a_norm = float(np.linalg.norm(a)) + 1e-6
+                    a_dir = a / a_norm
+                    cos_sim = np.sum(T_dir * a_dir, axis=-1)
+                    aff = np.maximum(0.0, cos_sim - 0.25) / 0.75
+                    # Насыщенная плотность слоя с нормализацией под оптический контраст нити
+                    c_density = darkness_total * aff * (1.0 / max(0.35, contrasts[k_i]))
+                    c_density = np.clip(c_density, 0.0, 1.0)
+                    c_density[mask == 0] = 0.0
+                    c_density[c_density < 0.05] = 0.0
+                    channel_densities.append(c_density.astype(np.float32))
 
                 for c_idx, sc in enumerate(selected_colors):
                     if self.omp_stop_flag:
                         break
                     name_ru = sc["name"]
                     hex_c = sc["hex"]
+                    contrast_c = contrasts[c_idx]
                     self._send_status(tr("st_adaptive_layer", lang, idx=c_idx + 1, n=len(selected_colors), name=name_ru), run_id=run_id)
 
-                    adapt_darkness = np.clip(d_2d[:, :, c_idx], 0.0, 1.0).astype(np.float32)
+                    adapt_darkness = channel_densities[c_idx]
                     adapt_edges, adapt_imp = _compute_channel_edges_and_importance(adapt_darkness, mask, boost=1.1)
 
                     ch_budget = estimate_channel_line_budget(adapt_darkness, mask, cm, max_lines, config["line_weight"])
@@ -811,6 +813,8 @@ class EvolutionCoordinator:
                     )
                     greedy = GreedyInitializer(cm, fc.target_darkness_flat, fc.importance_flat, config, adapt_radon, stop_Check=self._check_omp_stop_or_pause)
 
+                    # Масштабируем оптическую толщину нити пропорционально контрасту цвета нити
+                    alpha_layer = fc.line_alpha * max(0.30, contrast_c)
                     layer_display_idx = len(accumulated_layers)
                     def greedy_cb_adapt(status, path, _idx=layer_display_idx, _name=name_ru, _hex=hex_c):
                         snap = list(accumulated_layers)
@@ -820,7 +824,7 @@ class EvolutionCoordinator:
                             "data": {"text": f"{_name}: {status}", "layers": snap, "active_idx": _idx},
                         })
 
-                    base_path = greedy.run(ch_budget, greedy_cb_adapt, layer_label=name_ru, line_alpha=fc.line_alpha)
+                    base_path = greedy.run(ch_budget, greedy_cb_adapt, layer_label=name_ru, line_alpha=alpha_layer)
 
                     if len(base_path) >= 2 and not self.omp_stop_flag:
                         self.state.omp_baseline_fitness = fc.calculate_single_fitness(base_path)
