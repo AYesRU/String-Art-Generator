@@ -486,8 +486,8 @@ class UIManager:
         btn_auto.pack(fill=tk.X, pady=2)
         self._reg_text(btn_auto, "btn_auto")
 
-        self._create_double_slider_row(frame, "gamma", "sl_gamma", (0.50, 1.40), command=self.root.redraw_target_canvas)
-        self._create_double_slider_row(frame, "clahe_clip", "sl_clahe_clip", (0.0, 3.5), command=self.root.redraw_target_canvas)
+        self._create_double_slider_row(frame, "gamma", "sl_gamma", (0.30, 2.20), command=self.root.redraw_target_canvas)
+        self._create_double_slider_row(frame, "clahe_clip", "sl_clahe_clip", (0.0, 5.0), command=self.root.redraw_target_canvas)
         self.widgets["image_settings_frame"] = frame
 
     def _create_geometry_section(self, parent: tk.Widget) -> None:
@@ -544,12 +544,12 @@ class UIManager:
 
         self._update_adaptive_n_visibility()
 
-        self._create_slider_row(frame, "pins", "sl_pins", (120, 480))
-        self._create_double_slider_row(frame, "physical_diameter", "sl_physical_diameter", (20.0, 120.0))
-        self._create_slider_row(frame, "lines", "sl_lines", (400, 4500))
-        self._create_slider_row(frame, "line_weight", "sl_line_weight", (40, 95), command=self._on_visual_param_change)
-        self._create_slider_row(frame, "thread_thickness", "sl_thread_thickness", (1, 3), command=self._on_visual_param_change)
-        self._create_slider_row(frame, "fearless_factor", "sl_fearless_factor", (70, 100))
+        self._create_slider_row(frame, "pins", "sl_pins", (60, 720))
+        self._create_double_slider_row(frame, "physical_diameter", "sl_physical_diameter", (10.0, 150.0))
+        self._create_slider_row(frame, "lines", "sl_lines", (200, 10000))
+        self._create_slider_row(frame, "line_weight", "sl_line_weight", (20, 100), command=self._on_visual_param_change)
+        self._create_slider_row(frame, "thread_thickness", "sl_thread_thickness", (1, 6), command=self._on_visual_param_change)
+        self._create_slider_row(frame, "fearless_factor", "sl_fearless_factor", (50, 100))
         self.widgets["geometry_frame"] = frame
 
     def _create_algorithm_section(self, parent: tk.Widget) -> None:
@@ -721,6 +721,29 @@ class UIManager:
         self.chart_canvas = FigureCanvasTkAgg(fig, master=bottom_panel)
         self.chart_canvas.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=4, pady=2)
 
+    HARD_LIMITS_INT: Dict[str, Tuple[int, int]] = {
+        "pins": (20, 3000),
+        "lines": (10, 100000),
+        "line_weight": (1, 100),
+        "thread_thickness": (1, 20),
+        "fearless_factor": (0, 100),
+        "contour_weight": (0, 100),
+        "memetic_intensity": (1, 100),
+        "memetic_depth": (1, 500),
+        "radon_influence": (0, 100),
+        "num_islands": (1, 64),
+        "population_size": (2, 200),
+        "stages": (1, 50),
+        "mutation_rate": (1, 100),
+        "migration_interval": (1, 100),
+    }
+
+    HARD_LIMITS_FLOAT: Dict[str, Tuple[float, float]] = {
+        "physical_diameter": (1.0, 1000.0),
+        "gamma": (0.05, 5.0),
+        "clahe_clip": (0.0, 20.0),
+    }
+
     def _create_slider_row(
         self,
         parent: tk.Widget,
@@ -749,7 +772,14 @@ class UIManager:
                 val = int(round(float(entry.get().replace(",", "."))))
             except ValueError:
                 val = int(self.state.safe_get(name))
-            val = max(int(limits[0]), min(int(limits[1]), val))
+            h_min, h_max = self.HARD_LIMITS_INT.get(name, (1, 100000))
+            val = max(h_min, min(h_max, val))
+            cur_from = float(scale.cget("from"))
+            cur_to = float(scale.cget("to"))
+            if val < cur_from:
+                scale.configure(from_=val)
+            if val > cur_to:
+                scale.configure(to=val)
             var.set(val)
             if command:
                 command()
@@ -792,7 +822,14 @@ class UIManager:
                 val = float(entry.get().replace(",", "."))
             except ValueError:
                 val = float(self.state.safe_get(name))
-            val = round(max(float(limits[0]), min(float(limits[1]), val)), 2)
+            h_min, h_max = self.HARD_LIMITS_FLOAT.get(name, (0.01, 2000.0))
+            val = round(max(h_min, min(h_max, val)), 2)
+            cur_from = float(scale.cget("from"))
+            cur_to = float(scale.cget("to"))
+            if val < cur_from:
+                scale.configure(from_=val)
+            if val > cur_to:
+                scale.configure(to=val)
             var.set(val)
             if command:
                 command()
@@ -982,9 +1019,11 @@ class UIManager:
         lbl.pack(anchor="w", pady=(2, 1))
         flow = ttk.Frame(self._palette_frame)
         flow.pack(fill=tk.X, expand=True)
+        is_en = normalize_lang(self.state.lang) == "en"
         for i, c in enumerate(colors):
             hex_c = c.get("hex", "#333333")
-            name = c.get("name", f"Цвет {i+1}")
+            raw_name = c.get("name", f"Color {i+1}" if is_en else f"Цвет {i+1}")
+            name = c.get("name_en") if (is_en and c.get("name_en")) else translate_layer_name(raw_name, self.state.lang)
             rgb = c.get("rgb", [50, 50, 50])
             lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
             fg = "#111111" if lum > 145 else "#ffffff"

@@ -211,10 +211,13 @@ def get_display_presets(lang: str) -> List[str]:
     return [to_display_preset(k, lang) for k in PRESET_EN]
 
 
+from .color_catalog import COLOR_NAME_EN, COLOR_NAME_RU
+
+
 def translate_layer_name(name: str, lang: str) -> str:
     if normalize_lang(lang) == "en":
-        return LAYER_NAME_EN.get(name, name)
-    return _LAYER_NAME_RU.get(name, name)
+        return LAYER_NAME_EN.get(name, COLOR_NAME_EN.get(name, name))
+    return _LAYER_NAME_RU.get(name, COLOR_NAME_RU.get(name, name))
 
 
 def layer_short_code(name: str, lang: str) -> str:
