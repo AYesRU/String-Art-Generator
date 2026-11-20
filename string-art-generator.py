@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-String Art Studio Pro v9.7 — точка входа приложения.
+String Art Studio Pro v9.8 — точка входа приложения.
 Гибридный комплекс: точный Beer-Lambert DDA CSR OMP + Островной ГА переменной длины (удаление/добавление нитей)
 + Преобразование Радона (Ramp FBP) + GPU CUDA (PyTorch) + Монохром / Темная доска / адаптивный CMYK + .sart.json.
 """

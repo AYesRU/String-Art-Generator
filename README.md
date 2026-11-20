@@ -1,4 +1,4 @@
-# String Art Studio Pro v9.7 🎨🧵
+# String Art Studio Pro v9.8 🎨🧵
 
 <div align="center">
 
@@ -18,11 +18,15 @@
 <a name="english"></a>
 ## 🇬🇧 English
 
-**String Art Studio Pro v9.7** is an open-source algorithmic studio for generating high-definition **String Art** (thread art / filography / изонить) artworks from continuous thread paths — supporting **Monochrome Black Thread**, **White Thread on Dark Board**, and **Adaptive 4-Layer Subtractive CMYK Color**.
+**String Art Studio Pro v9.8** is an open-source algorithmic studio for generating high-definition **String Art** (thread art / filography / изонить) artworks from continuous thread paths — supporting **Monochrome Black Thread**, **White Thread on Dark Board**, and **Adaptive 4-Layer Subtractive CMYK Color**.
 
 It combines tomography mathematics (**Radon Transform + Ram-Lak Filtered Back Projection**), an **Exact Beer-Lambert Pre-Sliced DDA SciPy CSR Orthogonal Matching Pursuit (OMP)** initializer with per-channel physical thread budgets (automatically assigning **0 threads** to absent CMYK colors), a variable-length multi-threaded **Island Genetic Algorithm (GA)** with `O(L)` scratch-buffer delta thread pruning & insertion (decreasing excess threads and adding missing ones up to `max_lines`), **PyTorch CUDA GPU** batch fitness & optical rendering (`~7 ms` at 550px, `~60 ms` at 2400px Ultra-HD on RTX 5060, with seamless CPU fallback), and full `.sart.json` project persistence.
 
-### 🌟 Key Features (v9.7)
+### 🌟 Key Features (v9.8)
+* 🖥️ **Ergonomic Tabbed UI & Dedicated Player Bar**:
+  * **4 Sidebar Tabs**: Organizes controls into `🖼 Image`, `⚙ Algorithm`, `🎬 Player`, and `📦 Export` tabs, eliminating vertical clutter and scroll fatigue.
+  * **Dedicated Bottom Player Bar**: Anchors the interactive timeline scrubber, layer selector, step counter, navigation controls (`◀`, `▶ Auto`, `▶`), and quick toggles (`✨` Neon chord, `🔊` SAPI voice, `🪞` Split compare) directly below the artwork viewports.
+  * **Compact 7-Icon Export Row**: Quick one-click export bar (`[🌐] [📄] [📊] [🖼] [📐] [⭕] [⚙]`) with detailed tooltips on hover.
 * ⚡ **Ultra-Fast Adaptive Engine (Exact Beer-Lambert DDA CSR OMP + CUDA + Variable-Length Island GA)**:
   * **Vectorized Integer DDA CSR (`build_line_tables`)**: Builds 29,250 chords (260 pins) in `~390 ms` with **zero duplicate pixels** per chord.
   * **Exact Beer-Lambert Pre-Sliced CSR OMP**: Evaluates exact per-pixel Beer-Lambert error reduction (`~5,300–6,700 lines/sec` on CPU), stops cleanly without forced minimums, trims trailing bridge hops to the global-best prefix, and outputs **0 threads** for absent color channels.
@@ -79,11 +83,16 @@ python -m unittest discover -s tests -v
 <a name="русский"></a>
 ## 🇷🇺 Русский
 
-**String Art Studio Pro v9.7** — студия и высокопроизводительный алгоритмический комплекс с открытым исходным кодом для генерации картин в технике **String Art** (изонить / филография) из непрерывной нити: классические монохромные портреты, **белая нить на темной доске** и адаптивные цветные **4-слойные CMYK** композиции.
+**String Art Studio Pro v9.8** — студия и высокопроизводительный алгоритмический комплекс с открытым исходным кодом для генерации картин в технике **String Art** (изонить / филография) из непрерывной нити: классические монохромные портреты, **белая нить на темной доске** и адаптивные цветные **4-слойные CMYK** композиции.
 
-### 🌟 Ключевые возможности v9.7
+### 🌟 Ключевые возможности v9.8
 
-#### 1. ⚡ Гибридный адаптивный движок: Beer-Lambert DDA CSR OMP + PyTorch CUDA + Островной ГА переменной длины
+#### 1. 🖥️ Эргономичный интерфейс с вкладками и панелью плеера
+* **4 вкладки в боковой панели**: вместо бесконечной вертикальной прокрутки все элементы управления логично разбиты по вкладкам: `🖼 Изображение`, `⚙ Алгоритм`, `🎬 Плеер`, `📦 Экспорт`.
+* **Горизонтальная панель плеера под холстом**: ползунок шагов, переключатель слоёв, счетчик шагов, навигация (`◀`, `▶ Авто`, `▶`), неоновая подсветка (`✨`), диктор SAPI (`🔊`) и шторка сравнения (`🪞`) вынесены в удобную нижнюю полосу под холстом результата (как таймлайн в видеоредакторах).
+* **Компактная линейка экспорта в 1 клик**: аккуратный ряд из 7 кнопок-иконок (`[🌐] [📄] [📊] [🖼] [📐] [⭕] [⚙]`) с подробными всплывающими подсказками.
+
+#### 2. ⚡ Гибридный адаптивный движок: Beer-Lambert DDA CSR OMP + PyTorch CUDA + Островной ГА переменной длины
 * **Векторизованный целочисленный DDA CSR (`~390 мс`)**: построение 29 250 хорд (260 гвоздей) без сортировок `np.unique` и с **нулем дубликатов пикселей** в каждой хорде.
 * **Точный Beer-Lambert CSR OMP**: вычисляет точный выигрыш оптической модели по преднарезанным подматрицам `pin_sub_matrices` без принудительного минимума нитей, обрезает холостой хвост до лучшего префикса и ставит **0 нитей** для отсутствующих цветов (например, 0 синих нитей на красной картине).
 * **Индивидуальный расчет нитей по цветам CMYK (`estimate_channel_line_budget`)**: на старте рассчитывает физический бюджет нитей отдельно для Cyan, Magenta, Yellow и Black по интегралу оптической глубины Бера-Ламберта, сохраняя единую физическую плотность нити (`ref_lines`) для всех 4 катушек.
