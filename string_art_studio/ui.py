@@ -236,22 +236,38 @@ class UIManager:
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        left_col = ttk.Frame(container)
-        left_col.pack(side=tk.LEFT, fill=tk.Y, anchor="n", padx=(4, 2), expand=True)
-        right_col = ttk.Frame(container)
-        right_col.pack(side=tk.LEFT, fill=tk.Y, anchor="n", padx=(2, 4), expand=True)
+        sidebar_nb = ttk.Notebook(container)
+        sidebar_nb.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self.widgets["sidebar_notebook"] = sidebar_nb
 
-        self._create_image_settings_section(left_col)
-        self._create_geometry_section(left_col)
-        self._create_algorithm_section(left_col)
+        tab_image = ttk.Frame(sidebar_nb)
+        sidebar_nb.add(tab_image, text=self._t("tab_ctrl_image"))
 
-        self._create_fitness_and_radon_section(right_col)
-        self._create_inspector_section(right_col)
-        self._create_control_and_export_section(right_col)
+        tab_algo = ttk.Frame(sidebar_nb)
+        sidebar_nb.add(tab_algo, text=self._t("tab_ctrl_algo"))
+
+        tab_player = ttk.Frame(sidebar_nb)
+        sidebar_nb.add(tab_player, text=self._t("tab_ctrl_player"))
+
+        tab_export = ttk.Frame(sidebar_nb)
+        sidebar_nb.add(tab_export, text=self._t("tab_ctrl_export"))
+
+        self._create_image_settings_section(tab_image)
+        self._create_geometry_section(tab_image)
+
+        self._create_algorithm_section(tab_algo)
+        self._create_fitness_and_radon_section(tab_algo)
+
+        self._create_inspector_section(tab_player)
+        self._create_control_and_export_section(tab_export)
 
     def _create_display_area(self, parent: ttk.PanedWindow) -> None:
-        display_area = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
-        parent.add(display_area, weight=1)
+        # Right side: vertical frame with display area on top and player bar below
+        right_frame = ttk.Frame(parent)
+        parent.add(right_frame, weight=1)
+
+        display_area = ttk.PanedWindow(right_frame, orient=tk.HORIZONTAL)
+        display_area.pack(fill=tk.BOTH, expand=True)
 
         target_frame = ttk.LabelFrame(display_area, text=self._t("target_frame"), width=340)
         self._reg_text(target_frame, "target_frame")
@@ -268,6 +284,8 @@ class UIManager:
         results_notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self.widgets["results_notebook"] = results_notebook
 
+        self._create_player_bar(right_frame)
+
     def _on_tab_changed(self, _event=None) -> None:
         if not self.coordinator:
             return
@@ -280,6 +298,104 @@ class UIManager:
             self.on_result_canvas_resize(None, "overall")
         elif 1 <= idx <= int(self.state.safe_get("num_islands")):
             self.on_result_canvas_resize(None, idx - 1)
+
+    def _create_player_bar(self, parent: tk.Widget) -> None:
+        """Creates the player control bar below the display area."""
+        bar = tk.Frame(parent, bg="#eaeef2")
+        bar.pack(fill=tk.X, pady=3, padx=4)
+        self.widgets["player_bar"] = bar
+
+        # Active layer combobox
+        layer_cb = ttk.Combobox(
+            bar,
+            textvariable=self.state.vars["active_layer"],
+            values=[translate_layer_name("Черная нить", self.state.lang)],
+            state="readonly",
+            width=20,
+        )
+        layer_cb.pack(side=tk.LEFT, padx=(0, 2))
+        layer_cb.bind("<<ComboboxSelected>>", self._on_active_layer_changed)
+        self._add_tip(layer_cb, "active_layer")
+        self.widgets["active_layer_combo"] = layer_cb
+
+        # Separator
+        tk.Label(bar, text="|", bg="#eaeef2", fg="#aaaaaa").pack(side=tk.LEFT, padx=2)
+
+        # Player step label
+        step_lbl = tk.Label(
+            bar, text=self._t("player_idle"),
+            font=("Segoe UI", 8, "bold"), fg="#0969da", bg="#eaeef2"
+        )
+        step_lbl.pack(side=tk.LEFT, padx=(0, 4))
+        self.widgets["player_step_label"] = step_lbl
+
+        # Prev button
+        btn_prev = ttk.Button(bar, text="◀", width=3, command=lambda: self.root.step_player(-1))
+        btn_prev.pack(side=tk.LEFT, padx=1)
+
+        # Auto play button
+        btn_auto = ttk.Button(bar, text=self._t("btn_auto_play"), command=self.root.toggle_auto_play)
+        btn_auto.pack(side=tk.LEFT, padx=1)
+        self.widgets["auto_play_button"] = btn_auto
+
+        # Next button
+        btn_next = ttk.Button(bar, text="▶", width=3, command=lambda: self.root.step_player(1))
+        btn_next.pack(side=tk.LEFT, padx=1)
+
+        # Step scrubber slider
+        scrubber_var = self.state.vars["step_scrubber"]
+        self._slider_limits["step_scrubber"] = (1.0, 4500.0, True)
+
+        def _scrubber_cmd(v):
+            scrubber_var.set(int(round(float(v))))
+            self._on_scrubber_slider_move()
+
+        scrubber = ttk.Scale(
+            bar, from_=1, to=4500,
+            variable=scrubber_var, orient=tk.HORIZONTAL,
+            command=_scrubber_cmd,
+        )
+        scrubber.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        self.widgets["step_scrubber_scale"] = scrubber
+        self._add_tip(scrubber, "step_scrubber")
+
+        # Show active chord checkbutton (✨)
+        chk_neon = ttk.Checkbutton(
+            bar, text="✨",
+            variable=self.state.vars["show_active_chord"],
+            command=self._on_visual_param_change,
+        )
+        chk_neon.pack(side=tk.LEFT, padx=1)
+        self._add_tip(chk_neon, "show_active_chord")
+
+        # Voice checkbutton (🔊)
+        chk_voice = ttk.Checkbutton(
+            bar, text="🔊",
+            variable=self.state.vars["voice_enabled"],
+            command=self.root.on_voice_toggle,
+        )
+        if not SAPI_AVAILABLE:
+            chk_voice.config(state=tk.DISABLED)
+        chk_voice.pack(side=tk.LEFT, padx=1)
+        self._add_tip(chk_voice, "voice_enabled")
+
+        # Split compare: mirror label + small scale
+        tk.Label(bar, text="🪞", bg="#eaeef2").pack(side=tk.LEFT, padx=(4, 0))
+        split_var = self.state.vars["split_compare"]
+        self._slider_limits["split_compare"] = (0.0, 100.0, True)
+
+        def _split_cmd(v):
+            split_var.set(int(round(float(v))))
+            self._on_visual_param_change()
+
+        split_scale = ttk.Scale(
+            bar, from_=0, to=100,
+            variable=split_var, orient=tk.HORIZONTAL,
+            command=_split_cmd,
+        )
+        split_scale.pack(side=tk.LEFT, padx=2)
+        split_scale.configure(length=120)
+        self._add_tip(split_scale, "split_compare")
 
     def _create_section(self, parent: tk.Widget, title_key: str) -> ttk.LabelFrame:
         frame = ttk.LabelFrame(parent, text=self._t(title_key), padding=6)
@@ -472,69 +588,19 @@ class UIManager:
 
     def _create_inspector_section(self, parent: tk.Widget) -> None:
         frame = self._create_section(parent, "sec_inspector")
-
-        f_lay = ttk.Frame(frame)
-        f_lay.pack(fill=tk.X, pady=2)
-        lbl_lay = ttk.Label(f_lay, text=self._t("lbl_active_layer"), width=15)
-        lbl_lay.pack(side=tk.LEFT)
-        self._reg_text(lbl_lay, "lbl_active_layer")
-        layer_cb = ttk.Combobox(
-            f_lay,
-            textvariable=self.state.vars["active_layer"],
-            values=[translate_layer_name("Черная нить", self.state.lang)],
-            state="readonly",
+        kb_text = (
+            "⌨ Space / D / → = Next step\n"
+            "⌨ A / ← = Prev step\n"
+            "⌨ Player controls are in the bar below ↓"
         )
-        layer_cb.pack(fill=tk.X, expand=True)
-        layer_cb.bind("<<ComboboxSelected>>", self._on_active_layer_changed)
-        self._add_tip(layer_cb, "active_layer")
-        self.widgets["active_layer_combo"] = layer_cb
-
-        self._create_slider_row(frame, "step_scrubber", "sl_step_scrubber", (1, 4500), command=self._on_scrubber_slider_move)
-
-        f_step = ttk.Frame(frame)
-        f_step.pack(fill=tk.X, pady=2)
-        self.widgets["player_step_label"] = ttk.Label(
-            f_step, text=self._t("player_idle"), font=("Segoe UI", 8, "bold"), foreground="#0969da"
+        lbl = ttk.Label(
+            frame,
+            text=kb_text,
+            font=("Segoe UI", 8),
+            foreground="#57606a",
+            justify=tk.LEFT,
         )
-        self.widgets["player_step_label"].pack(side=tk.LEFT)
-
-        nav = ttk.Frame(frame)
-        nav.pack(fill=tk.X, pady=2)
-        btn_prev = ttk.Button(nav, text=self._t("btn_prev"), command=lambda: self.root.step_player(-1))
-        btn_auto = ttk.Button(nav, text=self._t("btn_auto_play"), command=self.root.toggle_auto_play)
-        btn_next = ttk.Button(nav, text=self._t("btn_next"), command=lambda: self.root.step_player(1))
-        btn_prev.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
-        btn_auto.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
-        btn_next.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
-        self._reg_text(btn_prev, "btn_prev")
-        self._reg_text(btn_next, "btn_next")
-        self.widgets["auto_play_button"] = btn_auto
-
-        opts = ttk.Frame(frame)
-        opts.pack(fill=tk.X, pady=2)
-        chk_neon = ttk.Checkbutton(
-            opts,
-            text=self._t("chk_neon"),
-            variable=self.state.vars["show_active_chord"],
-            command=self._on_visual_param_change,
-        )
-        chk_neon.pack(side=tk.LEFT)
-        self._reg_text(chk_neon, "chk_neon")
-        self._add_tip(chk_neon, "show_active_chord")
-
-        chk_voice = ttk.Checkbutton(
-            opts,
-            text=self._t("chk_voice"),
-            variable=self.state.vars["voice_enabled"],
-            command=self.root.on_voice_toggle,
-        )
-        if not SAPI_AVAILABLE:
-            chk_voice.config(state=tk.DISABLED)
-        chk_voice.pack(side=tk.RIGHT)
-        self._reg_text(chk_voice, "chk_voice")
-        self._add_tip(chk_voice, "voice_enabled")
-
-        self._create_slider_row(frame, "split_compare", "sl_split_compare", (0, 100), command=self._on_visual_param_change)
+        lbl.pack(anchor="w", pady=4, padx=4)
         self.widgets["inspector_frame"] = frame
 
     def _create_control_and_export_section(self, parent: tk.Widget) -> None:
@@ -577,34 +643,22 @@ class UIManager:
         self._add_tip(btn_prune, "prune")
         self.widgets["prune_button"] = btn_prune
 
-        btn_html = ttk.Button(
-            frame,
-            text=self._t("btn_export_html"),
-            command=self.coordinator.export_html,
-            state=tk.DISABLED,
-        )
-        btn_html.pack(fill=tk.X, pady=2)
-        self._reg_text(btn_html, "btn_export_html")
-        self._add_tip(btn_html, "export_html")
-        self.widgets["export_html_button"] = btn_html
-
-        grid = ttk.Frame(frame)
-        grid.pack(fill=tk.X, pady=1)
-        export_pairs = [
-            ("export_txt", "btn_export_txt", self.coordinator.export_txt, 0, 0),
-            ("export_csv", "btn_export_csv", self.coordinator.export_csv, 0, 1),
-            ("export_png", "btn_export_png", self.coordinator.export_png, 1, 0),
-            ("export_svg", "btn_export_svg", self.coordinator.export_svg, 1, 1),
-            ("export_template", "btn_export_template", self.coordinator.export_template, 2, 0),
-            ("export_gcode", "btn_export_gcode", self.coordinator.export_gcode, 2, 1),
+        # Compact icon-only export buttons row
+        icon_row = ttk.Frame(frame)
+        icon_row.pack(fill=tk.X, pady=2)
+        export_icons = [
+            ("export_html", "🌐", self.coordinator.export_html, "export_html"),
+            ("export_txt", "📄", self.coordinator.export_txt, "export_txt"),
+            ("export_csv", "📊", self.coordinator.export_csv, "export_csv"),
+            ("export_png", "🖼", self.coordinator.export_png, "export_png"),
+            ("export_svg", "📐", self.coordinator.export_svg, "export_svg"),
+            ("export_template", "⭕", self.coordinator.export_template, "export_template"),
+            ("export_gcode", "⚙", self.coordinator.export_gcode, "export_gcode"),
         ]
-        grid.columnconfigure(0, weight=1)
-        grid.columnconfigure(1, weight=1)
-        for name, text_key, cmd, r, c in export_pairs:
-            btn = ttk.Button(grid, text=self._t(text_key), command=cmd, state=tk.DISABLED)
-            btn.grid(row=r, column=c, sticky="ew", padx=1, pady=1)
-            self._reg_text(btn, text_key)
-            self._add_tip(btn, name)
+        for name, icon, cmd, tip_key in export_icons:
+            btn = ttk.Button(icon_row, text=icon, width=3, command=cmd, state=tk.DISABLED)
+            btn.pack(side=tk.LEFT, padx=1)
+            self._add_tip(btn, tip_key)
             self.widgets[f"{name}_button"] = btn
 
     def _create_stats_and_chart_area(self, parent: tk.Widget) -> None:
@@ -829,6 +883,13 @@ class UIManager:
         for i, lbl in self.main_island_labels.items():
             if not self.state.is_running:
                 lbl.config(text=self._t("island_done" if self.state.layers else "island_start", i=i + 1))
+
+        # Update sidebar notebook tab titles
+        nb = self.widgets.get("sidebar_notebook")
+        if isinstance(nb, ttk.Notebook):
+            tab_keys = ["tab_ctrl_image", "tab_ctrl_algo", "tab_ctrl_player", "tab_ctrl_export"]
+            for tab_id, key in zip(nb.tabs(), tab_keys):
+                nb.tab(tab_id, text=tr(key, code))
 
         self.update_layer_selector()
         self.update_player_step_label()
