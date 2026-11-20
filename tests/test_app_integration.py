@@ -148,6 +148,30 @@ class TestAppIntegration(unittest.TestCase):
             for lyr in app.state.layers:
                 self.assertLessEqual(max(0, len(lyr["path"]) - 1), 120)
 
+            # Проверка возврата к «🌈 Все цвета» в цветном режиме
+            cb = app.ui_manager.widgets["active_layer_combo"]
+            self.assertIn("🌈", cb["values"][0])
+            cb.current(0)
+            app.ui_manager._on_active_layer_changed()
+            app.update()
+            self.assertEqual(app.state.active_layer_idx, -1)
+            self.assertIn("Все цвета", app.ui_manager.widgets["player_step_label"].cget("text"))
+
+            # Проверка цветного рендеринга с произвольными цветами (не только CMYK)
+            test_layers = [
+                {"name": "Коралл", "color_hex": "#FF7F50", "path": [0, 40, 80, 0]},
+                {"name": "Лазурь", "color_hex": "#007FFF", "path": [20, 60, 100, 20]},
+            ]
+            rendered_pil = app.coordinator.canvas_manager.render_layers_to_pil(test_layers, output_size=100)
+            rendered_arr = np.array(rendered_pil)
+            # R, G, B каналы не должны быть идентичны (т.е. изображение цветное, а не серое)
+            self.assertFalse(np.array_equal(rendered_arr[:, :, 0], rendered_arr[:, :, 1]))
+
+            # Проверка отображения чипов палитры в UI
+            app.ui_manager.update_palette(chosen)
+            app.update()
+            self.assertGreater(len(app.ui_manager._palette_frame.winfo_children()), 0)
+
             # Тест экспорта HTML, TXT и сохранения/загрузки проекта (.sart.json) с пустым слоем Cyan
             with tempfile.TemporaryDirectory() as tmp:
                 out_html = os.path.join(tmp, "assistant.html")

@@ -732,30 +732,44 @@ class EvolutionCoordinator:
             elif is_adaptive:
                 n_colors = max(2, min(20, int(config.get("adaptive_n_colors", 5))))
                 self._send_status(tr("st_adaptive_selecting", lang, n=n_colors, total=len(COLOR_CATALOG)), run_id=run_id)
-                rgb_img = self.state.preprocessed_rgb_np if self.state.preprocessed_rgb_np is not None else np.zeros((64, 64, 3), np.uint8)
+                rgb_img = self.state.preprocessed_rgb_np if self.state.preprocessed_rgb_np is not None else np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), np.uint8)
                 selected_colors = self._select_adaptive_colors(rgb_img, n_colors)
                 max_lines = int(config["lines"])
+
+                # Обновляем визуальную палитру нитей в интерфейсе
+                self.queues["status_queue"].put({"type": "palette_update", "run_id": run_id, "data": selected_colors})
+
+                # Попиксельное цветоделение под выбранные цвета нитей (Beer-Lambert soft allocation)
+                mask = bundle.get("mask", np.ones_like(bundle["gray"], dtype=np.uint8) * 255)
+                total_dark = np.where(mask == 255, (255.0 - bundle["gray"].astype(np.float32)) / 255.0, 0.0).astype(np.float32)
+                img_f = rgb_img.astype(np.float32) / 255.0
+
+                sims = []
+                for sc in selected_colors:
+                    c_rgb = np.array([sc["rgb"][0], sc["rgb"][1], sc["rgb"][2]], dtype=np.float32) / 255.0
+                    diff_sq = np.sum((img_f - c_rgb) ** 2, axis=-1)
+                    sims.append(np.exp(-diff_sq / 0.12))
+                sim_stack = np.stack(sims, axis=0)
+                sim_sum = np.sum(sim_stack, axis=0, keepdims=True) + 1e-6
+                weights = sim_stack / sim_sum
 
                 for c_idx, sc in enumerate(selected_colors):
                     if self.omp_stop_flag:
                         break
                     name_ru = sc["name"]
                     hex_c = sc["hex"]
-                    r_c, g_c, b_c = sc["rgb"][0], sc["rgb"][1], sc["rgb"][2]
-                    brightness = (0.299 * r_c + 0.587 * g_c + 0.114 * b_c) / 255.0
-                    ch_budget = max(50, int(max_lines * max(0.1, 1.0 - brightness * 0.8)))
-
                     self._send_status(tr("st_adaptive_layer", lang, idx=c_idx + 1, n=n_colors, name=name_ru), run_id=run_id)
 
-                    adapt_edges = bundle["edges"]
-                    adapt_importance = np.ones_like(bundle["gray"], dtype=np.float32)
-                    mask = bundle.get("mask", np.ones_like(bundle["gray"], dtype=np.uint8) * 255)
-                    adapt_darkness = np.where(
-                        mask == 255,
-                        np.full_like(bundle["gray"], brightness, dtype=np.float32),
-                        0.0,
-                    ).astype(np.float32)
+                    adapt_darkness = np.clip(total_dark * weights[c_idx] * 1.35, 0.0, 1.0).astype(np.float32)
+                    blurred_ch = cv2.GaussianBlur(adapt_darkness, (3, 3), 0)
+                    sx = cv2.Sobel(blurred_ch, cv2.CV_32F, 1, 0, ksize=3)
+                    sy = cv2.Sobel(blurred_ch, cv2.CV_32F, 0, 1, ksize=3)
+                    adapt_edges = np.clip(np.sqrt(sx * sx + sy * sy) * 255.0 * 2.2, 0, 255).astype(np.uint8)
 
+                    ch_budget = estimate_channel_line_budget(adapt_darkness, mask, cm, max_lines, config["line_weight"])
+                    ch_budget = max(40, ch_budget)
+
+                    adapt_importance = np.ones_like(bundle["gray"], dtype=np.float32)
                     fc = FitnessCalculator(
                         bundle["gray"], adapt_edges, bundle["saliency"], adapt_importance,
                         cm, config, self.queues, target_darkness_override=adapt_darkness,
@@ -987,7 +1001,11 @@ class EvolutionCoordinator:
             "radon_map": self._handle_radon_map,
             "export_png_done": self._handle_export_png_done,
             "export_png_error": self._handle_export_png_error,
+            "palette_update": self._handle_palette_update,
         }.get(msg_type or "", lambda _d: None)
+
+    def _handle_palette_update(self, data: List[Dict[str, Any]]) -> None:
+        self.ui_manager.update_palette(data)
 
     def _handle_greedy_update(self, data: Dict[str, Any]) -> None:
         self.ui_manager.widgets["status_label"].config(text=data["text"])
@@ -1144,7 +1162,9 @@ class EvolutionCoordinator:
                 f"{layer_short_code(str(l.get('name', 'L')), self.state.lang)}:{max(0, len(l.get('path', [])) - 1)}"
                 for l in self.state.layers
             )
-            msg = self._t("st_done_cmyk_fmt", msg=data, per_layer=per_layer, total=total_lines)
+            is_adapt = "Адаптивный" in str(self.state.safe_get("color_mode") or "")
+            fmt_key = "st_done_adaptive_fmt" if is_adapt else "st_done_cmyk_fmt"
+            msg = self._t(fmt_key, msg=data, per_layer=per_layer, total=total_lines)
         else:
             msg = self._t("st_done_mono_fmt", msg=data, total=total_lines, rem=removed)
         self.ui_manager.widgets["status_label"].config(text=msg)

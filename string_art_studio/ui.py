@@ -537,6 +537,11 @@ class UIManager:
         )
         spn_n.pack(side=tk.RIGHT, padx=(2, 0))
         self.widgets["adaptive_n_spinbox"] = spn_n
+
+        # Визуальная палитра нитей (чипы выбранных цветов из каталога)
+        self._palette_frame = ttk.Frame(frame)
+        self._palette_frame.pack(fill=tk.X, pady=1)
+
         self._update_adaptive_n_visibility()
 
         self._create_slider_row(frame, "pins", "sl_pins", (120, 480))
@@ -920,44 +925,120 @@ class UIManager:
             cb["values"] = [disp_name]
             self.state.vars["active_layer"].set(disp_name)
             return
+
         unit = self._t("unit_lines_short")
-        labels = [
-            f"{translate_layer_name(str(l.get('name', f'Layer {i+1}')), self.state.lang)} ({max(0, len(l.get('path', [])) - 1)} {unit})"
-            for i, l in enumerate(self.state.layers)
-        ]
-        cb["values"] = labels
-        idx = min(self.state.active_layer_idx, len(labels) - 1)
-        self.state.active_layer_idx = max(0, idx)
-        self.state.vars["active_layer"].set(labels[self.state.active_layer_idx])
+        if len(self.state.layers) > 1:
+            total_all = sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers)
+            all_label = self._t("all_colors_option", total=total_all, unit=unit)
+            labels = [all_label]
+            for i, l in enumerate(self.state.layers):
+                c_name = translate_layer_name(str(l.get("name", f"Layer {i+1}")), self.state.lang)
+                c_hex = l.get("color_hex", "")
+                hex_part = f" [{c_hex}]" if c_hex and c_hex not in ("#111111", "#f5f5f5") else ""
+                n_lines = max(0, len(l.get("path", [])) - 1)
+                labels.append(f"{i+1}. {c_name}{hex_part} ({n_lines} {unit})")
+            cb["values"] = labels
+            if self.state.active_layer_idx < 0:
+                cb_idx = 0
+            else:
+                cb_idx = min(self.state.active_layer_idx + 1, len(labels) - 1)
+            cb.current(cb_idx)
+            self.state.vars["active_layer"].set(labels[cb_idx])
+        else:
+            labels = [
+                f"{translate_layer_name(str(l.get('name', f'Layer {i+1}')), self.state.lang)} ({max(0, len(l.get('path', [])) - 1)} {unit})"
+                for i, l in enumerate(self.state.layers)
+            ]
+            cb["values"] = labels
+            self.state.active_layer_idx = 0
+            cb.current(0)
+            self.state.vars["active_layer"].set(labels[0])
 
     def _update_adaptive_n_visibility(self, *_) -> None:
         mode = to_canonical_color_mode(str(self.state.safe_get("color_mode") or ""))
-        frame = getattr(self, "_adaptive_n_frame", None)
-        if frame:
-            if "Адаптивный" in mode:
-                frame.pack(fill=tk.X, pady=1)
+        f_spin = getattr(self, "_adaptive_n_frame", None)
+        f_pal = getattr(self, "_palette_frame", None)
+        is_adapt = "Адаптивный" in mode
+        if f_spin:
+            if is_adapt:
+                f_spin.pack(fill=tk.X, pady=1)
             else:
-                frame.pack_forget()
+                f_spin.pack_forget()
+        if f_pal:
+            if is_adapt:
+                f_pal.pack(fill=tk.X, pady=2)
+            else:
+                f_pal.pack_forget()
+
+    def update_palette(self, colors: List[Dict[str, Any]]) -> None:
+        """Отображает визуальные цветные чипы выбранных нитей с названием и HEX-кодом."""
+        if not hasattr(self, "_palette_frame"):
+            return
+        for child in self._palette_frame.winfo_children():
+            child.destroy()
+        if not colors:
+            return
+        lbl = ttk.Label(self._palette_frame, text=self._t("palette_title"), font=("Segoe UI", 8, "bold"))
+        lbl.pack(anchor="w", pady=(2, 1))
+        flow = ttk.Frame(self._palette_frame)
+        flow.pack(fill=tk.X, expand=True)
+        for i, c in enumerate(colors):
+            hex_c = c.get("hex", "#333333")
+            name = c.get("name", f"Цвет {i+1}")
+            rgb = c.get("rgb", [50, 50, 50])
+            lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+            fg = "#111111" if lum > 145 else "#ffffff"
+            chip = tk.Label(
+                flow,
+                text=f" {i+1}. {name} {hex_c} ",
+                bg=hex_c,
+                fg=fg,
+                font=("Segoe UI", 8, "bold"),
+                relief="ridge",
+                bd=1,
+                padx=3,
+                pady=1,
+                cursor="hand2",
+            )
+            chip.pack(side=tk.LEFT, padx=1, pady=1)
+            chip.bind("<Button-1>", lambda _e, idx=i: self._select_layer_by_index(idx))
+
+    def _select_layer_by_index(self, idx: int) -> None:
+        cb = self.widgets.get("active_layer_combo")
+        if isinstance(cb, ttk.Combobox) and 0 <= idx < len(self.state.layers):
+            target_cb_idx = idx + 1 if len(self.state.layers) > 1 else idx
+            if target_cb_idx < len(cb["values"]):
+                cb.current(target_cb_idx)
+                self._on_active_layer_changed()
 
     def _on_active_layer_changed(self, _event=None) -> None:
         if not self.state.layers:
             return
         cb = self.widgets.get("active_layer_combo")
-        idx = cb.current() if isinstance(cb, ttk.Combobox) else -1
-        if idx < 0 or idx >= len(self.state.layers):
-            sel_name = self.state.vars["active_layer"].get()
-            idx = next(
-                (
-                    i
-                    for i, l in enumerate(self.state.layers)
-                    if sel_name.startswith(translate_layer_name(str(l.get("name", "")), self.state.lang))
-                    or sel_name.startswith(str(l.get("name", "")))
-                ),
-                -1,
-            )
-        if 0 <= idx < len(self.state.layers):
-            self.state.active_layer_idx = idx
-            path = self.state.layers[idx].get("path", [])
+        cur_idx = cb.current() if isinstance(cb, ttk.Combobox) else -1
+
+        if len(self.state.layers) > 1:
+            if cur_idx == 0:
+                # Режим «🌈 Все цвета»: отображаем все цвета одновременно!
+                self.state.active_layer_idx = -1
+                total_all = sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers)
+                scale = self.widgets.get("step_scrubber_scale")
+                if isinstance(scale, ttk.Scale):
+                    scale.configure(to=max(1, total_all))
+                self.state.vars["step_scrubber"].set(max(1, total_all))
+                self.update_player_step_label()
+                self._on_visual_param_change()
+                return
+            elif cur_idx > 0:
+                layer_idx = cur_idx - 1
+            else:
+                layer_idx = 0
+        else:
+            layer_idx = max(0, cur_idx)
+
+        if 0 <= layer_idx < len(self.state.layers):
+            self.state.active_layer_idx = layer_idx
+            path = self.state.layers[layer_idx].get("path", [])
             max_steps = max(1, len(path) - 1)
             self.state.overall_best_chromosome = path
             scale = self.widgets.get("step_scrubber_scale")
@@ -975,7 +1056,15 @@ class UIManager:
         lbl = self.widgets.get("player_step_label")
         if not lbl:
             return
-        if not self.state.layers or self.state.active_layer_idx >= len(self.state.layers):
+        if not self.state.layers:
+            lbl.config(text=self._t("player_idle"))
+            return
+        if self.state.active_layer_idx < 0:
+            total_all = sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers)
+            step = max(1, min(total_all, int(self.state.safe_get("step_scrubber") or total_all)))
+            lbl.config(text=self._t("all_colors_step", step=step, total=total_all))
+            return
+        if self.state.active_layer_idx >= len(self.state.layers):
             lbl.config(text=self._t("player_idle"))
             return
         path = self.state.layers[self.state.active_layer_idx].get("path", [])
@@ -1238,7 +1327,8 @@ class UIManager:
                 split_pct = int(self.state.safe_get("split_compare") or 0)
                 if split_pct > 0:
                     split_x = int(display_size * (split_pct / 100.0))
-                    is_color = "CMYK" in to_canonical_color_mode(str(self.state.safe_get("color_mode")))
+                    canon_cm = to_canonical_color_mode(str(self.state.safe_get("color_mode")))
+                    is_color = "CMYK" in canon_cm or "Адаптивный" in canon_cm
                     if is_color and self.state.preprocessed_rgb_np is not None:
                         target_src = self.state.preprocessed_rgb_np
                         comp_np = np.array(img_shown.convert("RGB"))
@@ -1392,7 +1482,18 @@ class StringArtApp(tk.Tk):
         self.audio_assistant.toggle(bool(self.state.safe_get("voice_enabled")))
 
     def step_player(self, delta: int) -> None:
-        if not self.state.layers or self.state.active_layer_idx >= len(self.state.layers):
+        if not self.state.layers:
+            return
+        if self.state.active_layer_idx < 0:
+            total_s = sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers)
+            cur = int(self.state.safe_get("step_scrubber") or total_s)
+            new_s = max(1, min(total_s, cur + delta))
+            if new_s != cur:
+                self.state.vars["step_scrubber"].set(new_s)
+                self.ui_manager.update_player_step_label()
+                self.ui_manager._on_visual_param_change()
+            return
+        if self.state.active_layer_idx >= len(self.state.layers):
             return
         path = self.state.layers[self.state.active_layer_idx].get("path", [])
         if len(path) < 2:
@@ -1496,8 +1597,8 @@ class StringArtApp(tk.Tk):
         )
         self.state.preprocessed_target_np = bundle["gray"]
         self.state.preprocessed_rgb_np = bundle["rgb"]
-        is_cmyk = "CMYK" in color_mode
-        if is_cmyk:
+        is_color = "CMYK" in color_mode or "Адаптивный" in color_mode
+        if is_color:
             img_pil = Image.fromarray(bundle["rgb"])
         elif bundle.get("invert_board"):
             preview_gray = np.where(

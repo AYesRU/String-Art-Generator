@@ -646,15 +646,17 @@ class CanvasManager:
                 gray_u8 = (transmittance * 255.0).astype(np.uint8)
             result_rgb = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2RGB)
         else:
-            c_depth = np.zeros((out_dim, out_dim), dtype=np.float32)
-            m_depth = np.zeros((out_dim, out_dim), dtype=np.float32)
-            y_depth = np.zeros((out_dim, out_dim), dtype=np.float32)
-            k_depth = np.zeros((out_dim, out_dim), dtype=np.float32)
+            # Многоканальный цветной рендеринг: честная субтрактивная модель поглощения (Beer-Lambert)
+            # Корректно отображает как стандартный CMYK, так и любые произвольные цвета нитей из каталога!
+            d_r = np.zeros((out_dim, out_dim), dtype=np.float32)
+            d_g = np.zeros((out_dim, out_dim), dtype=np.float32)
+            d_b = np.zeros((out_dim, out_dim), dtype=np.float32)
 
             for l_idx, layer in enumerate(layers):
                 path = layer.get("path", [])
                 total_lines = max(0, len(path) - 1)
-                if max_step is None:
+                # active_layer_idx < 0 означает режим «Все цвета / Все слои»
+                if max_step is None or active_layer_idx < 0:
                     draw_count = total_lines
                 elif l_idx < active_layer_idx:
                     draw_count = total_lines
@@ -669,25 +671,38 @@ class CanvasManager:
                 ref_n = max(400, int(layer.get("ref_lines") or total_lines))
                 alpha_500 = self.get_line_alpha(ref_n, line_weight_percent)
                 d_layer = self._accumulate_path_depth(path, draw_count, out_dim, thickness, alpha_500)
+
+                # Определение RGB цвета нити в диапазоне [0.0, 1.0]
+                hex_color = str(layer.get("color_hex", "#111111")).lstrip("#")
                 name = layer.get("name", "").lower()
-                if "cyan" in name or "циан" in name or "голуб" in name:
-                    c_depth += d_layer
-                elif "magenta" in name or "маджент" in name or "пурпур" in name:
-                    m_depth += d_layer
+                if "cyan" in name or "циан" in name:
+                    r_c, g_c, b_c = 0.0, 1.0, 1.0
+                elif "magenta" in name or "маджент" in name:
+                    r_c, g_c, b_c = 1.0, 0.0, 1.0
                 elif "yellow" in name or "желт" in name:
-                    y_depth += d_layer
+                    r_c, g_c, b_c = 1.0, 1.0, 0.0
+                elif "black" in name or "черн" in name:
+                    r_c, g_c, b_c = 0.0, 0.0, 0.0
+                elif len(hex_color) == 6:
+                    try:
+                        r_c = int(hex_color[0:2], 16) / 255.0
+                        g_c = int(hex_color[2:4], 16) / 255.0
+                        b_c = int(hex_color[4:6], 16) / 255.0
+                    except ValueError:
+                        r_c, g_c, b_c = 0.0, 0.0, 0.0
                 else:
-                    k_depth += d_layer
+                    r_c, g_c, b_c = 0.0, 0.0, 0.0
 
-            tc = np.exp(-c_depth * 1.6)
-            tm = np.exp(-m_depth * 1.6)
-            ty = np.exp(-y_depth * 1.6)
-            tk = np.exp(-k_depth * 1.6)
+                # Нить поглощает свет своего дополнительного цвета:
+                # Белый фон (1,1,1) минус отражение нити (r_c, g_c, b_c)
+                d_r += d_layer * (1.0 - r_c)
+                d_g += d_layer * (1.0 - g_c)
+                d_b += d_layer * (1.0 - b_c)
 
-            r = np.clip(tc * tk * 255.0, 0.0, 255.0).astype(np.uint8)
-            g = np.clip(tm * tk * 255.0, 0.0, 255.0).astype(np.uint8)
-            b = np.clip(ty * tk * 255.0, 0.0, 255.0).astype(np.uint8)
-            result_rgb = cv2.merge([r, g, b])
+            r_u8 = np.clip(np.exp(-d_r * 1.6) * 255.0, 0.0, 255.0).astype(np.uint8)
+            g_u8 = np.clip(np.exp(-d_g * 1.6) * 255.0, 0.0, 255.0).astype(np.uint8)
+            b_u8 = np.clip(np.exp(-d_b * 1.6) * 255.0, 0.0, 255.0).astype(np.uint8)
+            result_rgb = cv2.merge([r_u8, g_u8, b_u8])
 
         pin_scale = out_dim / float(self.size)
 
