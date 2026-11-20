@@ -50,16 +50,18 @@ class TestAppIntegration(unittest.TestCase):
             app.update()
             self.assertTrue(app.ui_manager._adaptive_n_frame.winfo_ismapped())
 
-            # Проверка жадного алгоритма выбора адаптивных цветов из каталога
-            test_rgb = np.zeros((100, 100, 3), dtype=np.uint8)
-            test_rgb[:50, :50] = [255, 0, 0]    # Red
-            test_rgb[:50, 50:] = [0, 255, 0]    # Green
-            test_rgb[50:, :50] = [0, 0, 255]    # Blue
-            test_rgb[50:, 50:] = [255, 255, 0]  # Yellow
-            chosen = app.coordinator._select_adaptive_colors(test_rgb, n=4)
-            self.assertEqual(len(chosen), 4)
-            chosen_names = {c["name"] for c in chosen}
-            self.assertEqual(len(chosen_names), 4)  # Все 4 уникальны
+            # Проверка адаптивного подбора цветов: исключение белого фона и паразитных оттенков
+            test_white_bg = np.full((100, 100, 3), 255, dtype=np.uint8)
+            test_white_bg[20:50, 20:80] = [180, 20, 30]   # Темно-красный
+            test_white_bg[50:80, 20:80] = [20, 30, 140]   # Темно-синий
+            chosen_white_bg = app.coordinator._select_adaptive_colors(test_white_bg, n=3, invert_board=False)
+            chosen = chosen_white_bg
+            names_wb = [c["name"] for c in chosen_white_bg]
+            self.assertNotIn("Белый", names_wb)
+            self.assertNotIn("Абрикосовый", names_wb)
+            for c in chosen_white_bg:
+                # Нити должны иметь реальный физический контраст на белом холсте
+                self.assertLessEqual(c["rgb"][0] * 0.299 + c["rgb"][1] * 0.587 + c["rgb"][2] * 0.114, 215)
 
             app.state.vars["color_mode"].set("Монохром (Черная нить)")
             app.ui_manager._update_adaptive_n_visibility()

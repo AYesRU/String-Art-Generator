@@ -58,7 +58,7 @@ from .i18n import (
     tr,
     translate_layer_name,
 )
-from .preprocessing import prepare_target_image_bundle
+from .preprocessing import _compute_channel_edges_and_importance, prepare_target_image_bundle
 from .radon import RadonGuide
 from .color_catalog import COLOR_CATALOG
 
@@ -733,52 +733,77 @@ class EvolutionCoordinator:
                 n_colors = max(2, min(20, int(config.get("adaptive_n_colors", 5))))
                 self._send_status(tr("st_adaptive_selecting", lang, n=n_colors, total=len(COLOR_CATALOG)), run_id=run_id)
                 rgb_img = self.state.preprocessed_rgb_np if self.state.preprocessed_rgb_np is not None else np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), np.uint8)
-                selected_colors = self._select_adaptive_colors(rgb_img, n_colors)
+                mask = bundle.get("mask", np.ones_like(bundle["gray"], dtype=np.uint8) * 255)
+                invert_board = bool(bundle.get("invert_board", False))
+                selected_colors = self._select_adaptive_colors(rgb_img, n_colors, mask=mask, invert_board=invert_board)
                 max_lines = int(config["lines"])
 
                 # Обновляем визуальную палитру нитей в интерфейсе
                 self.queues["status_queue"].put({"type": "palette_update", "run_id": run_id, "data": selected_colors})
 
-                # Попиксельное цветоделение под выбранные цвета нитей (Beer-Lambert soft allocation)
-                mask = bundle.get("mask", np.ones_like(bundle["gray"], dtype=np.uint8) * 255)
-                total_dark = np.where(mask == 255, (255.0 - bundle["gray"].astype(np.float32)) / 255.0, 0.0).astype(np.float32)
-                img_f = rgb_img.astype(np.float32) / 255.0
+                # Предобработка исходного изображения под цветоделение (сглаживание шума и гамма)
+                rgb_smooth = cv2.bilateralFilter(rgb_img, d=5, sigmaColor=18, sigmaSpace=18)
+                gamma_val = float(config.get("gamma", 1.0))
+                if abs(gamma_val - 1.0) > 0.03:
+                    inv_gamma = 1.0 / max(0.1, gamma_val) if not invert_board else gamma_val
+                    table = np.array([((i / 255.0) ** inv_gamma) * 255.0 for i in range(256)], dtype=np.uint8)
+                    rgb_smooth = cv2.LUT(rgb_smooth, table)
 
-                sims = []
-                for sc in selected_colors:
-                    c_rgb = np.array([sc["rgb"][0], sc["rgb"][1], sc["rgb"][2]], dtype=np.float32) / 255.0
-                    diff_sq = np.sum((img_f - c_rgb) ** 2, axis=-1)
-                    sims.append(np.exp(-diff_sq / 0.12))
-                sim_stack = np.stack(sims, axis=0)
-                sim_sum = np.sum(sim_stack, axis=0, keepdims=True) + 1e-6
-                weights = sim_stack / sim_sum
+                rgb_norm = np.clip(rgb_smooth.astype(np.float32) / 255.0, 0.0, 1.0)
+                h, w, _ = rgb_norm.shape
+
+                # Физическое оптическое поглощение (Beer-Lambert NNLS)
+                if not invert_board:
+                    T = np.clip(1.0 - rgb_norm, 0.0, 1.0)
+                    A_cols = [np.clip(1.0 - (np.array(c["rgb"], dtype=np.float32) / 255.0), 0.0, 1.0) for c in selected_colors]
+                else:
+                    T = np.clip(rgb_norm, 0.0, 1.0)
+                    A_cols = [np.clip(np.array(c["rgb"], dtype=np.float32) / 255.0, 0.0, 1.0) for c in selected_colors]
+
+                A = np.column_stack(A_cols)  # (3, K)
+                T_flat = T.reshape(-1, 3)     # (N, 3)
+
+                # Точное решение NNLS через быстрый проективный градиент
+                AtA = (A.T @ A).astype(np.float32)
+                AtT = (T_flat @ A).astype(np.float32)
+                L_lip = float(np.linalg.norm(AtA, 2))
+                step_sz = 1.0 / max(1e-4, L_lip)
+
+                d_mat = np.zeros((len(T_flat), len(selected_colors)), dtype=np.float32)
+                for _ in range(16):
+                    grad = d_mat @ AtA - AtT
+                    d_mat = np.maximum(0.0, d_mat - step_sz * grad)
+
+                d_2d = d_mat.reshape(h, w, len(selected_colors))
+
+                # Подавление краевых и фоновых шумов
+                for k_i in range(len(selected_colors)):
+                    ch_arr = d_2d[:, :, k_i]
+                    ch_arr[mask == 0] = 0.0
+                    ch_arr[ch_arr < 0.05] = 0.0
 
                 for c_idx, sc in enumerate(selected_colors):
                     if self.omp_stop_flag:
                         break
                     name_ru = sc["name"]
                     hex_c = sc["hex"]
-                    self._send_status(tr("st_adaptive_layer", lang, idx=c_idx + 1, n=n_colors, name=name_ru), run_id=run_id)
+                    self._send_status(tr("st_adaptive_layer", lang, idx=c_idx + 1, n=len(selected_colors), name=name_ru), run_id=run_id)
 
-                    adapt_darkness = np.clip(total_dark * weights[c_idx] * 1.35, 0.0, 1.0).astype(np.float32)
-                    blurred_ch = cv2.GaussianBlur(adapt_darkness, (3, 3), 0)
-                    sx = cv2.Sobel(blurred_ch, cv2.CV_32F, 1, 0, ksize=3)
-                    sy = cv2.Sobel(blurred_ch, cv2.CV_32F, 0, 1, ksize=3)
-                    adapt_edges = np.clip(np.sqrt(sx * sx + sy * sy) * 255.0 * 2.2, 0, 255).astype(np.uint8)
+                    adapt_darkness = np.clip(d_2d[:, :, c_idx], 0.0, 1.0).astype(np.float32)
+                    adapt_edges, adapt_imp = _compute_channel_edges_and_importance(adapt_darkness, mask, boost=1.1)
 
                     ch_budget = estimate_channel_line_budget(adapt_darkness, mask, cm, max_lines, config["line_weight"])
-                    ch_budget = max(40, ch_budget)
+                    if ch_budget < 25:
+                        if np.sum(adapt_darkness > 0.06) < 80:
+                            logging.info(f"Слой '{name_ru}' не имеет достаточного бюджета ({ch_budget} нитей) — пропуск.")
+                            continue
+                        ch_budget = 40
 
-                    adapt_importance = np.ones_like(bundle["gray"], dtype=np.float32)
                     fc = FitnessCalculator(
-                        bundle["gray"], adapt_edges, bundle["saliency"], adapt_importance,
+                        bundle["gray"], adapt_edges, bundle["saliency"], adapt_imp,
                         cm, config, self.queues, target_darkness_override=adapt_darkness,
                     )
                     self.active_fitness_calc = fc
-
-                    if ch_budget == 0:
-                        accumulated_layers.append({"name": name_ru, "color_hex": hex_c, "path": [], "ref_lines": max_lines})
-                        continue
 
                     adapt_radon = (
                         RadonGuide(bundle["gray"], adapt_edges, cm, config, compute_fbp=False, density_override=adapt_darkness)
@@ -786,7 +811,8 @@ class EvolutionCoordinator:
                     )
                     greedy = GreedyInitializer(cm, fc.target_darkness_flat, fc.importance_flat, config, adapt_radon, stop_Check=self._check_omp_stop_or_pause)
 
-                    def greedy_cb_adapt(status, path, _idx=c_idx, _name=name_ru, _hex=hex_c):
+                    layer_display_idx = len(accumulated_layers)
+                    def greedy_cb_adapt(status, path, _idx=layer_display_idx, _name=name_ru, _hex=hex_c):
                         snap = list(accumulated_layers)
                         snap.append({"name": _name, "color_hex": _hex, "path": path, "ref_lines": max_lines})
                         self.queues["status_queue"].put({
@@ -798,11 +824,11 @@ class EvolutionCoordinator:
 
                     if len(base_path) >= 2 and not self.omp_stop_flag:
                         self.state.omp_baseline_fitness = fc.calculate_single_fitness(base_path)
-                        self.state.layer_best_fitnesses[c_idx] = self.state.omp_baseline_fitness - 1e-6
+                        self.state.layer_best_fitnesses[layer_display_idx] = self.state.omp_baseline_fitness - 1e-6
                         adapt_stages = max(2, config.get("stages", 5) // 2)
                         mgr = IslandManagerThread(
                             config, self.queues, fc, base_path, adapt_radon,
-                            layer_idx=c_idx, layer_name=name_ru, emit_done=False,
+                            layer_idx=layer_display_idx, layer_name=name_ru, emit_done=False,
                             stages_override=adapt_stages, patience_scale=0.55,
                             run_id=run_id, max_lines=ch_budget,
                         )
@@ -812,14 +838,21 @@ class EvolutionCoordinator:
                         if mgr.best_result is not None:
                             base_path = list(mgr.best_result.get("chromosome", []))
 
-                    accumulated_layers.append({"name": name_ru, "color_hex": hex_c, "path": base_path, "ref_lines": max_lines})
-                    n_done = max(0, len(base_path) - 1)
-                    self.queues["status_queue"].put({
-                        "type": "greedy_update", "run_id": run_id,
-                        "data": {"text": f"{name_ru}: готово ({n_done} нитей)", "layers": list(accumulated_layers), "active_idx": c_idx},
-                    })
+                    if len(base_path) >= 2:
+                        accumulated_layers.append({"name": name_ru, "color_hex": hex_c, "path": base_path, "ref_lines": max_lines})
+                        n_done = max(0, len(base_path) - 1)
+                        self.queues["status_queue"].put({
+                            "type": "greedy_update", "run_id": run_id,
+                            "data": {"text": f"{name_ru}: готово ({n_done} нитей)", "layers": list(accumulated_layers), "active_idx": len(accumulated_layers) - 1},
+                        })
+                    else:
+                        logging.info(f"Слой '{name_ru}' не получил нитей (0 линий) и был исключен.")
 
-                msg = tr("st_stopped_user", lang) if self.omp_stop_flag else tr("st_adaptive_done", lang, n=n_colors)
+                self.state.layers = list(accumulated_layers)
+                active_palette = [{"name": l["name"], "hex": l["color_hex"]} for l in accumulated_layers]
+                self.queues["status_queue"].put({"type": "palette_update", "run_id": run_id, "data": active_palette})
+
+                msg = tr("st_stopped_user", lang) if self.omp_stop_flag else tr("st_adaptive_done", lang, n=len(accumulated_layers))
                 self.queues["status_queue"].put({"type": "done", "run_id": run_id, "data": msg})
 
         except Exception:
@@ -835,22 +868,25 @@ class EvolutionCoordinator:
             time.sleep(0.06)
         return self.omp_stop_flag
 
-    def _select_adaptive_colors(self, rgb_image: np.ndarray, n: int) -> List[Dict[str, Any]]:
-        """Выбирает N цветов из COLOR_CATALOG жадным алгоритмом в пространстве CIE Lab."""
+    def _select_adaptive_colors(
+        self,
+        rgb_image: np.ndarray,
+        n: int,
+        mask: Optional[np.ndarray] = None,
+        invert_board: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Выбирает N оптимальных контрастных цветов нитей из COLOR_CATALOG жадным алгоритмом в CIE Lab."""
         img_f32 = rgb_image.astype(np.float32) / 255.0
 
         def _rgb_to_lab(arr: np.ndarray) -> np.ndarray:
-            # sRGB -> линейный RGB
-            mask = arr > 0.04045
-            lin = np.where(mask, ((arr + 0.055) / 1.055) ** 2.4, arr / 12.92)
-            # Линейный RGB -> XYZ D65
+            mask_s = arr > 0.04045
+            lin = np.where(mask_s, ((arr + 0.055) / 1.055) ** 2.4, arr / 12.92)
             m = np.array([[0.4124564, 0.3575761, 0.1804375],
                           [0.2126729, 0.7151522, 0.0721750],
                           [0.0193339, 0.1191920, 0.9503041]], dtype=np.float32)
             shape = lin.shape
             flat = lin.reshape(-1, 3) @ m.T
             flat /= np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
-            # XYZ -> Lab
             eps = 0.008856
             kappa = 903.3
             fx = np.where(flat > eps, flat ** (1.0 / 3.0), (kappa * flat + 16.0) / 116.0)
@@ -860,38 +896,93 @@ class EvolutionCoordinator:
             lab = np.stack([L, a, b], axis=-1)
             return lab.reshape(shape[:-1] + (3,))
 
-        # Subsample image pixels for speed
-        flat_img = img_f32.reshape(-1, 3)
-        step = max(1, len(flat_img) // 4096)
-        sampled = flat_img[::step]
-        sampled_lab = _rgb_to_lab(sampled)  # (N, 3)
-
-        # Catalog colors in Lab
         cat_rgb = np.array([[c["rgb"][0], c["rgb"][1], c["rgb"][2]] for c in COLOR_CATALOG], dtype=np.float32) / 255.0
         cat_lab = _rgb_to_lab(cat_rgb)  # (K, 3)
 
-        # Greedy farthest-point coverage
-        selected_indices: List[int] = []
-        min_dists = np.full(len(sampled_lab), np.inf, dtype=np.float32)
+        # Фильтрация заведомо неэффективных нитей под цвет холста:
+        # На светлом холсте исключаем белые/пастельные цвета без контраста (L > 82 или слабая оптическая плотность)
+        # На темном холсте исключаем черные/околочерные цвета (L < 18)
+        if not invert_board:
+            valid_indices = [
+                i for i in range(len(COLOR_CATALOG))
+                if cat_lab[i, 0] <= 82.0
+                and (3.0 - np.sum(cat_rgb[i])) >= 0.35
+                and not (np.max(cat_rgb[i]) - np.min(cat_rgb[i]) < 0.06 and np.sum(cat_rgb[i]) > 2.2)
+            ]
+        else:
+            valid_indices = [
+                i for i in range(len(COLOR_CATALOG))
+                if cat_lab[i, 0] >= 18.0
+                and np.sum(cat_rgb[i]) >= 0.35
+            ]
 
-        for _ in range(n):
-            best_idx = -1
-            best_gain = -1.0
-            diff = sampled_lab[:, np.newaxis, :] - cat_lab[np.newaxis, :, :]  # (N, K, 3)
-            dists_all = np.sqrt(np.sum(diff ** 2, axis=-1))  # (N, K)
-            new_min_all = np.minimum(min_dists[:, np.newaxis], dists_all)  # (N, K)
-            gains = np.sum(min_dists[:, np.newaxis] - new_min_all, axis=0)  # (K,)
-            # Mask already selected
-            for si in selected_indices:
-                gains[si] = -1.0
+        if not valid_indices:
+            valid_indices = list(range(len(COLOR_CATALOG)))
+
+        cand_lab = cat_lab[valid_indices]
+        cand_colors = [COLOR_CATALOG[i] for i in valid_indices]
+
+        # Извлечение только пигментированных пикселей (не фоновой белой бумаги)
+        gray = 0.299 * img_f32[:, :, 0] + 0.587 * img_f32[:, :, 1] + 0.114 * img_f32[:, :, 2]
+        if not invert_board:
+            darkness = 1.0 - gray
+        else:
+            darkness = gray
+
+        if mask is not None:
+            darkness = np.where(mask.reshape(darkness.shape) == 255, darkness, 0.0)
+
+        pigment_mask = darkness > 0.06
+        if np.sum(pigment_mask) < 20:
+            pigment_mask = darkness > float(np.percentile(darkness, 40))
+        if np.sum(pigment_mask) < 10:
+            pigment_mask = np.ones_like(darkness, dtype=bool)
+
+        sampled_rgb = img_f32[pigment_mask]
+        sampled_w = darkness[pigment_mask]
+        sampled_lab = _rgb_to_lab(sampled_rgb)
+
+        if len(sampled_lab) > 4096:
+            step = len(sampled_lab) // 4096
+            sampled_lab = sampled_lab[::step]
+            sampled_w = sampled_w[::step]
+
+        diff = sampled_lab[:, np.newaxis, :] - cand_lab[np.newaxis, :, :]  # (N, K, 3)
+        dists_all = np.sqrt(np.sum(diff ** 2, axis=-1))  # (N, K)
+
+        # 1-й цвет: взвешенный центроид (1-medoid) активных пикселей изображения
+        init_losses = np.sum(sampled_w[:, np.newaxis] * dists_all, axis=0)
+        first_idx = int(np.argmin(init_losses))
+        selected_cand = [first_idx]
+        min_dists = dists_all[:, first_idx].copy()
+
+        # 2-й .. N-й цвета: жадный поиск наибольшего прироста аппроксимации с контролем цветоразличимости (ΔE >= 14)
+        for _ in range(n - 1):
+            gains = np.sum(sampled_w[:, np.newaxis] * np.maximum(0.0, min_dists[:, np.newaxis] - dists_all), axis=0)
+            for s in selected_cand:
+                gains[s] = -1.0
+                dist_s = np.sqrt(np.sum((cand_lab - cand_lab[s]) ** 2, axis=-1))
+                gains[dist_s < 14.0] = -1.0
+
             best_idx = int(np.argmax(gains))
-            best_gain = float(gains[best_idx])
-            if best_gain <= 0 and selected_indices:
-                break
-            selected_indices.append(best_idx)
+            if gains[best_idx] <= 0:
+                rem = [i for i in range(len(cand_colors)) if i not in selected_cand]
+                if not rem:
+                    break
+                cand_dist_to_sel = np.min([np.sqrt(np.sum((cand_lab[rem] - cand_lab[s]) ** 2, axis=-1)) for s in selected_cand], axis=0)
+                best_idx = rem[int(np.argmax(cand_dist_to_sel))]
+
+            selected_cand.append(best_idx)
             min_dists = np.minimum(min_dists, dists_all[:, best_idx])
 
-        return [COLOR_CATALOG[i] for i in selected_indices]
+        # Сортировка слоев от светлых тонов к темным (на белом холсте темные нити поверх светлых создают четкие контуры)
+        result = [cand_colors[i] for i in selected_cand]
+        if not invert_board:
+            result.sort(key=lambda c: (0.299 * c["rgb"][0] + 0.587 * c["rgb"][1] + 0.114 * c["rgb"][2]), reverse=True)
+        else:
+            result.sort(key=lambda c: (0.299 * c["rgb"][0] + 0.587 * c["rgb"][1] + 0.114 * c["rgb"][2]), reverse=False)
+
+        return result
 
     def _push_analytic_maps(self, diff_map: np.ndarray, depth_2d: np.ndarray) -> None:
         self.render_results_queue.put(("diff_map", self._create_fast_diff_pil(diff_map)))
