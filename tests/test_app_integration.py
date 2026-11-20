@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 import unittest
+import numpy as np
 from PIL import Image, ImageDraw
 
 from string_art_studio.ui import StringArtApp
@@ -37,6 +38,33 @@ class TestAppIntegration(unittest.TestCase):
             # Проверка безопасности при временной пустой строке в tk.Variable
             app.state.vars["pins"].set("")
             self.assertIsNotNone(app.state.get_config()["pins"])
+
+            # Проверка, что вкладки островов удалены и осталось ровно 5 вкладок результатов
+            nb = app.ui_manager.widgets["results_notebook"]
+            self.assertEqual(len(nb.tabs()), 5)
+            self.assertEqual(list(app.ui_manager.result_canvases.keys()), ["overall", "diff_map", "density_heatmap", "fit_saliency", "radon_sinogram"])
+
+            # Проверка переключения режима Адаптивный подбор (N цветов) и видимости спинбокса
+            app.state.vars["color_mode"].set("Адаптивный подбор (N цветов)")
+            app.ui_manager._update_adaptive_n_visibility()
+            app.update()
+            self.assertTrue(app.ui_manager._adaptive_n_frame.winfo_ismapped())
+
+            # Проверка жадного алгоритма выбора адаптивных цветов из каталога
+            test_rgb = np.zeros((100, 100, 3), dtype=np.uint8)
+            test_rgb[:50, :50] = [255, 0, 0]    # Red
+            test_rgb[:50, 50:] = [0, 255, 0]    # Green
+            test_rgb[50:, :50] = [0, 0, 255]    # Blue
+            test_rgb[50:, 50:] = [255, 255, 0]  # Yellow
+            chosen = app.coordinator._select_adaptive_colors(test_rgb, n=4)
+            self.assertEqual(len(chosen), 4)
+            chosen_names = {c["name"] for c in chosen}
+            self.assertEqual(len(chosen_names), 4)  # Все 4 уникальны
+
+            app.state.vars["color_mode"].set("Монохром (Черная нить)")
+            app.ui_manager._update_adaptive_n_visibility()
+            app.update()
+            self.assertFalse(app.ui_manager._adaptive_n_frame.winfo_ismapped())
 
             # Быстрый полный прогон Монохром (CSR OMP + Island GA + Delta)
             app.state.vars["pins"].set(140)

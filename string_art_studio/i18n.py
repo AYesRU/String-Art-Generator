@@ -36,6 +36,7 @@ COLOR_MODE_EN: Dict[str, str] = {
     "Монохром (Черная нить)": "Monochrome (Black Thread)",
     "Белая нить (Темная доска)": "White Thread (Dark Board)",
     "Цветной CMYK (4 нити)": "Color CMYK (4 Threads)",
+    "Адаптивный подбор (N цветов)": "Adaptive Color Matching (N colors)",
 }
 _COLOR_MODE_TO_CANON: Dict[str, str] = {
     **{k: k for k in COLOR_MODE_EN},
@@ -392,6 +393,10 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "st_error": "Ошибка!",
         "st_done_cmyk_fmt": "{msg} ({per_layer} | Всего: {total})",
         "st_done_mono_fmt": "{msg} (Нитей: {total}, удалено петель: {rem})",
+        "sl_adaptive_n_colors": "Количество цветов (N)",
+        "st_adaptive_selecting": "Адаптивный подбор: выбор {n} цветов из каталога ({total} вариантов)...",
+        "st_adaptive_layer": "Адаптивный слой {idx}/{n} ({name})...",
+        "st_adaptive_done": "Адаптивный подбор завершен ({n} цветов)!",
     },
     "en": {
         "dashboard_frame": "Evolution Dashboard & Algorithm Analytics",
@@ -549,6 +554,10 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "st_error": "Error!",
         "st_done_cmyk_fmt": "{msg} ({per_layer} | Total: {total})",
         "st_done_mono_fmt": "{msg} (Threads: {total}, loops pruned: {rem})",
+        "sl_adaptive_n_colors": "Number of Colors (N)",
+        "st_adaptive_selecting": "Adaptive matching: selecting {n} colors from catalog ({total} variants)...",
+        "st_adaptive_layer": "Adaptive layer {idx}/{n} ({name})...",
+        "st_adaptive_done": "Adaptive color matching done ({n} colors)!",
     },
 }
 

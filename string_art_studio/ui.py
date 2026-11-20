@@ -296,8 +296,9 @@ class UIManager:
         idx = notebook.index(sel)
         if idx == 0:
             self.on_result_canvas_resize(None, "overall")
-        elif 1 <= idx <= int(self.state.safe_get("num_islands")):
-            self.on_result_canvas_resize(None, idx - 1)
+        elif 1 <= idx <= 4:
+            key = ["diff_map", "density_heatmap", "fit_saliency", "radon_sinogram"][idx - 1]
+            self.on_result_canvas_resize(None, key)
 
     def _create_player_bar(self, parent: tk.Widget) -> None:
         """Creates the player control bar below the display area."""
@@ -520,8 +521,23 @@ class UIManager:
         )
         color_combo.pack(fill=tk.X, expand=True)
         color_combo.bind("<<ComboboxSelected>>", self.root.redraw_target_canvas)
+        color_combo.bind("<<ComboboxSelected>>", self._update_adaptive_n_visibility, add="+")
         self._add_tip(color_combo, "color_mode")
         self.widgets["color_combo"] = color_combo
+
+        # Spinbox для адаптивного режима N цветов
+        self._adaptive_n_frame = ttk.Frame(frame)
+        self._adaptive_n_frame.pack(fill=tk.X, pady=1)
+        lbl_n = ttk.Label(self._adaptive_n_frame, text=self._t("sl_adaptive_n_colors"), width=15)
+        lbl_n.pack(side=tk.LEFT)
+        self._reg_text(lbl_n, "sl_adaptive_n_colors")
+        spn_n = ttk.Spinbox(
+            self._adaptive_n_frame, from_=2, to=20,
+            textvariable=self.state.vars["adaptive_n_colors"], width=5, state="readonly",
+        )
+        spn_n.pack(side=tk.RIGHT, padx=(2, 0))
+        self.widgets["adaptive_n_spinbox"] = spn_n
+        self._update_adaptive_n_visibility()
 
         self._create_slider_row(frame, "pins", "sl_pins", (120, 480))
         self._create_double_slider_row(frame, "physical_diameter", "sl_physical_diameter", (20.0, 120.0))
@@ -868,15 +884,13 @@ class UIManager:
         notebook = self.widgets.get("results_notebook")
         if isinstance(notebook, ttk.Notebook):
             tabs = notebook.tabs()
-            n_islands = max(0, len(tabs) - 5)
-            tab_titles = [self._t("tab_overall")]
-            tab_titles.extend(self._t("tab_island", i=i + 1) for i in range(n_islands))
-            tab_titles.extend([
+            tab_titles = [
+                self._t("tab_overall"),
                 self._t("tab_diff_map"),
                 self._t("tab_density"),
                 self._t("tab_saliency"),
                 self._t("tab_radon"),
-            ])
+            ]
             for tab_id, title in zip(tabs, tab_titles):
                 notebook.tab(tab_id, text=title)
 
@@ -915,6 +929,15 @@ class UIManager:
         idx = min(self.state.active_layer_idx, len(labels) - 1)
         self.state.active_layer_idx = max(0, idx)
         self.state.vars["active_layer"].set(labels[self.state.active_layer_idx])
+
+    def _update_adaptive_n_visibility(self, *_) -> None:
+        mode = to_canonical_color_mode(str(self.state.safe_get("color_mode") or ""))
+        frame = getattr(self, "_adaptive_n_frame", None)
+        if frame:
+            if "Адаптивный" in mode:
+                frame.pack(fill=tk.X, pady=1)
+            else:
+                frame.pack_forget()
 
     def _on_active_layer_changed(self, _event=None) -> None:
         if not self.state.layers:
@@ -1000,8 +1023,6 @@ class UIManager:
         self.result_photo_refs.clear()
 
         self._create_notebook_tab("overall", self._t("tab_overall"), notebook)
-        for i in range(num_islands):
-            self._create_notebook_tab(i, self._t("tab_island", i=i + 1), notebook)
 
         self._create_analysis_canvas_tab(notebook, "diff_map", self._t("tab_diff_map"))
         self._create_analysis_canvas_tab(notebook, "density_heatmap", self._t("tab_density"))

@@ -3,7 +3,7 @@
 String Art Studio Pro — Hybrid CSR OMP + Island GA + Radon FBP + CUDA String Art Generator.
 """
 
-__version__ = "9.8.0"
+__version__ = "9.9.0"
 APP_TITLE = f"String Art Studio Pro v{__version__[:3]}"
 
 IMAGE_SIZE = 500

@@ -60,6 +60,7 @@ from .i18n import (
 )
 from .preprocessing import prepare_target_image_bundle
 from .radon import RadonGuide
+from .color_catalog import COLOR_CATALOG
 
 if TYPE_CHECKING:
     from .ui import StringArtApp, UIManager
@@ -101,6 +102,7 @@ class AppState:
             "show_active_chord": tk.BooleanVar(value=True),
             "voice_enabled": tk.BooleanVar(value=False),
             "split_compare": tk.IntVar(value=0),
+            "adaptive_n_colors": tk.IntVar(value=5),
         }
         self._defaults: Dict[str, Any] = {k: v.get() for k, v in self.vars.items()}
         self.original_image: Optional[Image.Image] = None
@@ -272,11 +274,11 @@ class EvolutionCoordinator:
                 if (
                     key == "overall"
                     and self.active_fitness_calc is not None
-                    and len(layers_data) == 1
                     and (now - self._last_analytic_map_time > 0.45 or render_params.get("force_maps"))
                 ):
                     self._last_analytic_map_time = now
-                    path_main = layers_data[0].get("path", [])
+                    _ali = active_layer_idx if active_layer_idx < len(layers_data) else 0
+                    path_main = layers_data[_ali].get("path", []) if layers_data else []
                     if len(path_main) >= 2:
                         _, diff_map, depth_2d = self.active_fitness_calc.calculate_single_fitness_and_maps(path_main)
                         self._push_analytic_maps(diff_map, depth_2d)
@@ -484,6 +486,7 @@ class EvolutionCoordinator:
             cm = self._ensure_canvas_manager(config)
             channels = bundle["channels"]
             is_cmyk = len(channels) > 1
+            is_adaptive = "Адаптивный" in config.get("color_mode", "")
             radon_enabled = bool(config.get("radon_enabled", True))
 
             radon_guide = None
@@ -515,7 +518,7 @@ class EvolutionCoordinator:
 
             accumulated_layers: List[Dict[str, Any]] = []
 
-            if not is_cmyk:
+            if not is_cmyk and not is_adaptive:
                 ch = channels[0]
                 ch_edges = ch.get("edges", bundle["edges"])
                 max_lines = int(config["lines"])
@@ -589,7 +592,7 @@ class EvolutionCoordinator:
                     max_lines=max_lines,
                 )
                 self.manager_thread.start()
-            else:
+            elif is_cmyk:
                 # 4-слойный CMYK синтез с индивидуальным первоначальным расчетом бюджета нитей на каждый цвет
                 max_lines = int(config["lines"])
                 ch_budgets = [
@@ -726,6 +729,85 @@ class EvolutionCoordinator:
                 msg = tr("st_stopped_user", lang) if self.omp_stop_flag else tr("st_cmyk_done", lang)
                 self.queues["status_queue"].put({"type": "done", "run_id": run_id, "data": msg})
 
+            elif is_adaptive:
+                n_colors = max(2, min(20, int(config.get("adaptive_n_colors", 5))))
+                self._send_status(tr("st_adaptive_selecting", lang, n=n_colors, total=len(COLOR_CATALOG)), run_id=run_id)
+                rgb_img = self.state.preprocessed_rgb_np if self.state.preprocessed_rgb_np is not None else np.zeros((64, 64, 3), np.uint8)
+                selected_colors = self._select_adaptive_colors(rgb_img, n_colors)
+                max_lines = int(config["lines"])
+
+                for c_idx, sc in enumerate(selected_colors):
+                    if self.omp_stop_flag:
+                        break
+                    name_ru = sc["name"]
+                    hex_c = sc["hex"]
+                    r_c, g_c, b_c = sc["rgb"][0], sc["rgb"][1], sc["rgb"][2]
+                    brightness = (0.299 * r_c + 0.587 * g_c + 0.114 * b_c) / 255.0
+                    ch_budget = max(50, int(max_lines * max(0.1, 1.0 - brightness * 0.8)))
+
+                    self._send_status(tr("st_adaptive_layer", lang, idx=c_idx + 1, n=n_colors, name=name_ru), run_id=run_id)
+
+                    adapt_edges = bundle["edges"]
+                    adapt_importance = np.ones_like(bundle["gray"], dtype=np.float32)
+                    mask = bundle.get("mask", np.ones_like(bundle["gray"], dtype=np.uint8) * 255)
+                    adapt_darkness = np.where(
+                        mask == 255,
+                        np.full_like(bundle["gray"], brightness, dtype=np.float32),
+                        0.0,
+                    ).astype(np.float32)
+
+                    fc = FitnessCalculator(
+                        bundle["gray"], adapt_edges, bundle["saliency"], adapt_importance,
+                        cm, config, self.queues, target_darkness_override=adapt_darkness,
+                    )
+                    self.active_fitness_calc = fc
+
+                    if ch_budget == 0:
+                        accumulated_layers.append({"name": name_ru, "color_hex": hex_c, "path": [], "ref_lines": max_lines})
+                        continue
+
+                    adapt_radon = (
+                        RadonGuide(bundle["gray"], adapt_edges, cm, config, compute_fbp=False, density_override=adapt_darkness)
+                        if radon_enabled else None
+                    )
+                    greedy = GreedyInitializer(cm, fc.target_darkness_flat, fc.importance_flat, config, adapt_radon, stop_Check=self._check_omp_stop_or_pause)
+
+                    def greedy_cb_adapt(status, path, _idx=c_idx, _name=name_ru, _hex=hex_c):
+                        snap = list(accumulated_layers)
+                        snap.append({"name": _name, "color_hex": _hex, "path": path, "ref_lines": max_lines})
+                        self.queues["status_queue"].put({
+                            "type": "greedy_update", "run_id": run_id,
+                            "data": {"text": f"{_name}: {status}", "layers": snap, "active_idx": _idx},
+                        })
+
+                    base_path = greedy.run(ch_budget, greedy_cb_adapt, layer_label=name_ru, line_alpha=fc.line_alpha)
+
+                    if len(base_path) >= 2 and not self.omp_stop_flag:
+                        self.state.omp_baseline_fitness = fc.calculate_single_fitness(base_path)
+                        self.state.layer_best_fitnesses[c_idx] = self.state.omp_baseline_fitness - 1e-6
+                        adapt_stages = max(2, config.get("stages", 5) // 2)
+                        mgr = IslandManagerThread(
+                            config, self.queues, fc, base_path, adapt_radon,
+                            layer_idx=c_idx, layer_name=name_ru, emit_done=False,
+                            stages_override=adapt_stages, patience_scale=0.55,
+                            run_id=run_id, max_lines=ch_budget,
+                        )
+                        self.manager_thread = mgr
+                        mgr.start()
+                        mgr.join()
+                        if mgr.best_result is not None:
+                            base_path = list(mgr.best_result.get("chromosome", []))
+
+                    accumulated_layers.append({"name": name_ru, "color_hex": hex_c, "path": base_path, "ref_lines": max_lines})
+                    n_done = max(0, len(base_path) - 1)
+                    self.queues["status_queue"].put({
+                        "type": "greedy_update", "run_id": run_id,
+                        "data": {"text": f"{name_ru}: готово ({n_done} нитей)", "layers": list(accumulated_layers), "active_idx": c_idx},
+                    })
+
+                msg = tr("st_stopped_user", lang) if self.omp_stop_flag else tr("st_adaptive_done", lang, n=n_colors)
+                self.queues["status_queue"].put({"type": "done", "run_id": run_id, "data": msg})
+
         except Exception:
             logging.error("Ошибка при подготовке эволюции", exc_info=True)
             self.queues["status_queue"].put({
@@ -738,6 +820,64 @@ class EvolutionCoordinator:
         while not self.omp_pause_event.is_set() and not self.omp_stop_flag:
             time.sleep(0.06)
         return self.omp_stop_flag
+
+    def _select_adaptive_colors(self, rgb_image: np.ndarray, n: int) -> List[Dict[str, Any]]:
+        """Выбирает N цветов из COLOR_CATALOG жадным алгоритмом в пространстве CIE Lab."""
+        img_f32 = rgb_image.astype(np.float32) / 255.0
+
+        def _rgb_to_lab(arr: np.ndarray) -> np.ndarray:
+            # sRGB -> линейный RGB
+            mask = arr > 0.04045
+            lin = np.where(mask, ((arr + 0.055) / 1.055) ** 2.4, arr / 12.92)
+            # Линейный RGB -> XYZ D65
+            m = np.array([[0.4124564, 0.3575761, 0.1804375],
+                          [0.2126729, 0.7151522, 0.0721750],
+                          [0.0193339, 0.1191920, 0.9503041]], dtype=np.float32)
+            shape = lin.shape
+            flat = lin.reshape(-1, 3) @ m.T
+            flat /= np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
+            # XYZ -> Lab
+            eps = 0.008856
+            kappa = 903.3
+            fx = np.where(flat > eps, flat ** (1.0 / 3.0), (kappa * flat + 16.0) / 116.0)
+            L = 116.0 * fx[:, 1] - 16.0
+            a = 500.0 * (fx[:, 0] - fx[:, 1])
+            b = 200.0 * (fx[:, 1] - fx[:, 2])
+            lab = np.stack([L, a, b], axis=-1)
+            return lab.reshape(shape[:-1] + (3,))
+
+        # Subsample image pixels for speed
+        flat_img = img_f32.reshape(-1, 3)
+        step = max(1, len(flat_img) // 4096)
+        sampled = flat_img[::step]
+        sampled_lab = _rgb_to_lab(sampled)  # (N, 3)
+
+        # Catalog colors in Lab
+        cat_rgb = np.array([[c["rgb"][0], c["rgb"][1], c["rgb"][2]] for c in COLOR_CATALOG], dtype=np.float32) / 255.0
+        cat_lab = _rgb_to_lab(cat_rgb)  # (K, 3)
+
+        # Greedy farthest-point coverage
+        selected_indices: List[int] = []
+        min_dists = np.full(len(sampled_lab), np.inf, dtype=np.float32)
+
+        for _ in range(n):
+            best_idx = -1
+            best_gain = -1.0
+            diff = sampled_lab[:, np.newaxis, :] - cat_lab[np.newaxis, :, :]  # (N, K, 3)
+            dists_all = np.sqrt(np.sum(diff ** 2, axis=-1))  # (N, K)
+            new_min_all = np.minimum(min_dists[:, np.newaxis], dists_all)  # (N, K)
+            gains = np.sum(min_dists[:, np.newaxis] - new_min_all, axis=0)  # (K,)
+            # Mask already selected
+            for si in selected_indices:
+                gains[si] = -1.0
+            best_idx = int(np.argmax(gains))
+            best_gain = float(gains[best_idx])
+            if best_gain <= 0 and selected_indices:
+                break
+            selected_indices.append(best_idx)
+            min_dists = np.minimum(min_dists, dists_all[:, best_idx])
+
+        return [COLOR_CATALOG[i] for i in selected_indices]
 
     def _push_analytic_maps(self, diff_map: np.ndarray, depth_2d: np.ndarray) -> None:
         self.render_results_queue.put(("diff_map", self._create_fast_diff_pil(diff_map)))
@@ -913,11 +1053,6 @@ class EvolutionCoordinator:
         self.state.island_best_fitnesses[island_id] = fitness
         self.best_chromosomes_by_key[island_id] = chromosome
         config = self.state.get_config()
-
-        notebook = self.ui_manager.widgets["results_notebook"]
-        sel = notebook.select()
-        if sel and notebook.index(sel) == island_id + 1:
-            self.request_canvas_update(island_id, (chromosome, config["pins"], config["thread_thickness"]), {})
 
         if data.get("force_update") or fitness > self.state.layer_best_fitnesses.get(layer_idx, -1.0):
             self.state.layer_best_fitnesses[layer_idx] = fitness
