@@ -21,6 +21,15 @@ from PIL import Image
 from . import IMAGE_SIZE
 from .i18n import to_canonical_shape
 
+# Идеальные краски штатных слоев CMYK (ключи — имена слоев в нижнем регистре, RU и EN)
+_CMYK_INK_RGB: Dict[str, Tuple[float, float, float]] = {
+    "циан (cyan)": (0.0, 1.0, 1.0), "cyan": (0.0, 1.0, 1.0),
+    "маджента (magenta)": (1.0, 0.0, 1.0), "magenta": (1.0, 0.0, 1.0),
+    "желтый (yellow)": (1.0, 1.0, 0.0), "yellow": (1.0, 1.0, 0.0),
+    "черный (black)": (0.0, 0.0, 0.0), "black": (0.0, 0.0, 0.0),
+    "черная нить": (0.0, 0.0, 0.0), "black thread": (0.0, 0.0, 0.0),
+}
+
 try:
     import torch
 
@@ -674,15 +683,12 @@ class CanvasManager:
 
                 # Определение RGB цвета нити в диапазоне [0.0, 1.0]
                 hex_color = str(layer.get("color_hex", "#111111")).lstrip("#")
-                name = layer.get("name", "").lower()
-                if "cyan" in name or "циан" in name:
-                    r_c, g_c, b_c = 0.0, 1.0, 1.0
-                elif "magenta" in name or "маджент" in name:
-                    r_c, g_c, b_c = 1.0, 0.0, 1.0
-                elif "yellow" in name or "желт" in name:
-                    r_c, g_c, b_c = 1.0, 1.0, 0.0
-                elif "black" in name or "черн" in name:
-                    r_c, g_c, b_c = 0.0, 0.0, 0.0
+                name = str(layer.get("name", "")).strip().lower()
+                # Идеальные краски подставляются ТОЛЬКО для штатных слоев CMYK (точное совпадение имени).
+                # Цвета каталога («Темный желтовато-коричневый», «Коричневато-черный» …) рисуются строго по HEX.
+                cmyk_ink = _CMYK_INK_RGB.get(name)
+                if cmyk_ink is not None:
+                    r_c, g_c, b_c = cmyk_ink
                 elif len(hex_color) == 6:
                     try:
                         r_c = int(hex_color[0:2], 16) / 255.0

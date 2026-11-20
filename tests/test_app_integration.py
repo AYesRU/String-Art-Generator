@@ -162,12 +162,30 @@ class TestAppIntegration(unittest.TestCase):
             # Проверка цветного рендеринга с произвольными цветами (не только CMYK)
             test_layers = [
                 {"name": "Коралл", "color_hex": "#FF7F50", "path": [0, 40, 80, 0]},
-                {"name": "Лазурь", "color_hex": "#007FFF", "path": [20, 60, 100, 20]},
+                {"name": "Темный желтовато-коричневый", "color_hex": "#3F2512", "path": [20, 60, 100, 20]},
             ]
             rendered_pil = app.coordinator.canvas_manager.render_layers_to_pil(test_layers, output_size=100)
             rendered_arr = np.array(rendered_pil)
             # R, G, B каналы не должны быть идентичны (т.е. изображение цветное, а не серое)
             self.assertFalse(np.array_equal(rendered_arr[:, :, 0], rendered_arr[:, :, 1]))
+
+            # Проверка 8-цветного адаптивного цветоделения Бера-Ламберта: ни один присутствующий цвет не обнуляется
+            multi_img = np.full((120, 120, 3), 255, dtype=np.uint8)
+            multi_img[10:40, 10:55] = [250, 165, 25]   # Оранжево-желтый
+            multi_img[10:40, 65:110] = [45, 115, 210]  # Синий
+            multi_img[45:75, 10:55] = [35, 140, 50]    # Зеленый
+            multi_img[45:75, 65:110] = [205, 30, 35]   # Красный
+            multi_img[80:110, 10:55] = [220, 170, 135] # Телесный/бежевый
+            multi_img[80:110, 65:110] = [65, 35, 20]   # Темно-коричневый
+            sel_multi = app.coordinator._select_adaptive_colors(multi_img, n=6, invert_board=False)
+            self.assertEqual(len(sel_multi), 6)
+            mask_multi = np.full((120, 120), 255, dtype=np.uint8)
+            dens_multi = app.coordinator._decompose_adaptive_channels(
+                multi_img.astype(np.float32) / 255.0, sel_multi, mask_multi, invert_board=False
+            )
+            self.assertEqual(len(dens_multi), 6)
+            active_channels = sum(1 for d_m in dens_multi if int(np.sum(d_m > 0.12)) >= 40)
+            self.assertEqual(active_channels, 6, "Все 6 подобранных цветов должны получить информативную плотность")
 
             # Проверка отображения чипов палитры в UI
             app.ui_manager.update_palette(chosen)
