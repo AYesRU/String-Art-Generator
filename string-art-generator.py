@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-String Art Studio Pro v9.8 — точка входа приложения.
+String Art Studio Pro v9.9.0 — точка входа приложения.
 Гибридный комплекс: точный Beer-Lambert DDA CSR OMP + Островной ГА переменной длины (удаление/добавление нитей)
-+ Преобразование Радона (Ramp FBP) + GPU CUDA (PyTorch) + Монохром / Темная доска / адаптивный CMYK + .sart.json.
++ Преобразование Радона (Ramp FBP) + GPU CUDA (PyTorch) + Монохром / Темная доска / CMYK / Адаптивный подбор (N цветов) + .sart.json.
 """
 
 import logging
-import os
-import sys
 import tkinter as tk
 import traceback
 from tkinter import messagebox
@@ -66,8 +64,6 @@ __all__ = [
 
 if __name__ == "__main__":
     try:
-        if getattr(sys, "frozen", False):
-            os.environ["OPENCV_SALIENCY_PATH"] = os.path.join(sys._MEIPASS, "opencv-saliency")
         main()
     except Exception:
         logging.critical("Critical error while starting application", exc_info=True)

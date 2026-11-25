@@ -27,6 +27,7 @@ from matplotlib.figure import Figure
 
 from . import (
     APP_TITLE,
+    IMAGE_SIZE,
     PRESETS,
     TOOLTIPS,
 )
@@ -136,7 +137,7 @@ class UIManager:
         self.ax_fitness: Optional[plt.Axes] = None
         self.ax_mut: Optional[plt.Axes] = None
         self.chart_canvas: Optional[FigureCanvasTkAgg] = None
-        self._slider_limits: Dict[str, Tuple[float, float, bool]] = {}
+        self._last_palette_colors: List[Dict[str, Any]] = []
         self._i18n_widgets: List[Tuple[tk.Widget, str, str]] = []
         self._tooltips: List[Tuple[ToolTip, str]] = []
         self._last_thread_length_m: Optional[float] = None
@@ -345,14 +346,13 @@ class UIManager:
 
         # Step scrubber slider
         scrubber_var = self.state.vars["step_scrubber"]
-        self._slider_limits["step_scrubber"] = (1.0, 4500.0, True)
 
         def _scrubber_cmd(v):
             scrubber_var.set(int(round(float(v))))
             self._on_scrubber_slider_move()
 
         scrubber = ttk.Scale(
-            bar, from_=1, to=4500,
+            bar, from_=1, to=10000,
             variable=scrubber_var, orient=tk.HORIZONTAL,
             command=_scrubber_cmd,
         )
@@ -383,7 +383,6 @@ class UIManager:
         # Split compare: mirror label + small scale
         tk.Label(bar, text="🪞", bg="#eaeef2").pack(side=tk.LEFT, padx=(4, 0))
         split_var = self.state.vars["split_compare"]
-        self._slider_limits["split_compare"] = (0.0, 100.0, True)
 
         def _split_cmd(v):
             split_var.set(int(round(float(v))))
@@ -536,6 +535,8 @@ class UIManager:
             textvariable=self.state.vars["adaptive_n_colors"], width=5, state="readonly",
         )
         spn_n.pack(side=tk.RIGHT, padx=(2, 0))
+        self._add_tip(lbl_n, "adaptive_n_colors")
+        self._add_tip(spn_n, "adaptive_n_colors")
         self.widgets["adaptive_n_spinbox"] = spn_n
 
         # Визуальная палитра нитей (чипы выбранных цветов из каталога)
@@ -609,19 +610,15 @@ class UIManager:
 
     def _create_inspector_section(self, parent: tk.Widget) -> None:
         frame = self._create_section(parent, "sec_inspector")
-        kb_text = (
-            "⌨ Space / D / → = Next step\n"
-            "⌨ A / ← = Prev step\n"
-            "⌨ Player controls are in the bar below ↓"
-        )
         lbl = ttk.Label(
             frame,
-            text=kb_text,
+            text=self._t("kb_shortcuts_hint"),
             font=("Segoe UI", 8),
             foreground="#57606a",
             justify=tk.LEFT,
         )
         lbl.pack(anchor="w", pady=4, padx=4)
+        self._reg_text(lbl, "kb_shortcuts_hint")
         self.widgets["inspector_frame"] = frame
 
     def _create_control_and_export_section(self, parent: tk.Widget) -> None:
@@ -722,7 +719,7 @@ class UIManager:
         self.chart_canvas.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=4, pady=2)
 
     HARD_LIMITS_INT: Dict[str, Tuple[int, int]] = {
-        "pins": (20, 3000),
+        "pins": (20, 1200),
         "lines": (10, 100000),
         "line_weight": (1, 100),
         "thread_thickness": (1, 20),
@@ -752,7 +749,6 @@ class UIManager:
         limits: Tuple[int, int],
         command: Optional[Callable] = None,
     ) -> None:
-        self._slider_limits[name] = (float(limits[0]), float(limits[1]), True)
         f = ttk.Frame(parent)
         f.pack(fill=tk.X, pady=1)
         lbl = ttk.Label(f, text=f"{self._t(text_key)}:", width=15)
@@ -802,7 +798,6 @@ class UIManager:
         limits: Tuple[float, float],
         command: Optional[Callable] = None,
     ) -> None:
-        self._slider_limits[name] = (float(limits[0]), float(limits[1]), False)
         f = ttk.Frame(parent)
         f.pack(fill=tk.X, pady=1)
         lbl = ttk.Label(f, text=f"{self._t(text_key)}:", width=15)
@@ -948,6 +943,8 @@ class UIManager:
                 nb.tab(tab_id, text=tr(key, code))
 
         self.update_layer_selector()
+        if self._last_palette_colors:
+            self.update_palette(self._last_palette_colors)
         self.update_player_step_label()
         self.update_title()
         self.update_chart()
@@ -1009,6 +1006,7 @@ class UIManager:
 
     def update_palette(self, colors: List[Dict[str, Any]]) -> None:
         """Отображает визуальные цветные чипы выбранных нитей с названием и HEX-кодом."""
+        self._last_palette_colors = list(colors) if colors else []
         if not hasattr(self, "_palette_frame"):
             return
         for child in self._palette_frame.winfo_children():
@@ -1525,11 +1523,22 @@ class StringArtApp(tk.Tk):
             return
         if self.state.active_layer_idx < 0:
             total_s = sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers)
+            if total_s <= 0:
+                return
             cur = int(self.state.safe_get("step_scrubber") or total_s)
             new_s = max(1, min(total_s, cur + delta))
             if new_s != cur:
                 self.state.vars["step_scrubber"].set(new_s)
                 self.ui_manager.update_player_step_label()
+                if self.state.safe_get("voice_enabled") and delta > 0:
+                    rem = new_s
+                    for lyr in self.state.layers:
+                        lp = lyr.get("path", [])
+                        cnt = max(0, len(lp) - 1)
+                        if rem <= cnt and rem < len(lp):
+                            self.audio_assistant.announce_chord(lp[rem - 1], lp[rem])
+                            break
+                        rem -= cnt
                 self.ui_manager._on_visual_param_change()
             return
         if self.state.active_layer_idx >= len(self.state.layers):
@@ -1547,6 +1556,15 @@ class StringArtApp(tk.Tk):
                 self.audio_assistant.announce_chord(path[new_s - 1], path[new_s])
             self.ui_manager._on_visual_param_change()
 
+    def _current_player_max_step(self) -> int:
+        if not self.state.layers:
+            return 0
+        if self.state.active_layer_idx < 0:
+            return sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers)
+        if self.state.active_layer_idx >= len(self.state.layers):
+            return 0
+        return max(0, len(self.state.layers[self.state.active_layer_idx].get("path", [])) - 1)
+
     def toggle_auto_play(self) -> None:
         btn = self.ui_manager.widgets.get("auto_play_button")
         if self._auto_play_job:
@@ -1555,18 +1573,23 @@ class StringArtApp(tk.Tk):
             if btn:
                 btn.config(text=self._t("btn_auto_play"))
         else:
-            if not self.state.layers:
+            max_s = self._current_player_max_step()
+            if max_s <= 0:
                 return
+            cur = int(self.state.safe_get("step_scrubber") or 1)
+            if cur >= max_s and max_s > 1:
+                self.state.vars["step_scrubber"].set(1)
+                self.ui_manager.update_player_step_label()
+                self.ui_manager._on_visual_param_change()
             if btn:
                 btn.config(text=self._t("btn_auto_stop"))
             self._auto_play_tick()
 
     def _auto_play_tick(self) -> None:
-        if not self.state.layers or self.state.active_layer_idx >= len(self.state.layers):
+        max_s = self._current_player_max_step()
+        if max_s <= 0:
             self.toggle_auto_play()
             return
-        path = self.state.layers[self.state.active_layer_idx].get("path", [])
-        max_s = max(1, len(path) - 1)
         cur = int(self.state.safe_get("step_scrubber") or 1)
         if cur < max_s:
             self.step_player(1)
@@ -1626,9 +1649,10 @@ class StringArtApp(tk.Tk):
         display_size = max(60, min(w, h) - 10)
         color_mode = to_canonical_color_mode(str(self.state.safe_get("color_mode") or "Монохром (Черная нить)"))
         shape = to_canonical_shape(str(self.state.safe_get("canvas_shape") or "Круг"))
+        # Всегда сохраняем предобработанные массивы в эталонном разрешении IMAGE_SIZE (500x500)
         bundle = prepare_target_image_bundle(
             self.state.original_image,
-            display_size,
+            IMAGE_SIZE,
             clahe_clip=float(self.state.safe_get("clahe_clip") or 1.3),
             gamma=float(self.state.safe_get("gamma") or 0.82),
             shape=shape,
@@ -1649,7 +1673,8 @@ class StringArtApp(tk.Tk):
             img_pil = Image.fromarray(preview_gray)
         else:
             img_pil = Image.fromarray(bundle["gray"])
-        self.state.target_image_tk = ImageTk.PhotoImage(img_pil)
+        img_shown = img_pil.resize((display_size, display_size), Image.Resampling.LANCZOS) if img_pil.size != (display_size, display_size) else img_pil
+        self.state.target_image_tk = ImageTk.PhotoImage(img_shown)
         canvas.delete("all")
         canvas.create_image(w // 2, h // 2, anchor=tk.CENTER, image=self.state.target_image_tk)
 

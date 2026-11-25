@@ -661,11 +661,18 @@ class CanvasManager:
             d_g = np.zeros((out_dim, out_dim), dtype=np.float32)
             d_b = np.zeros((out_dim, out_dim), dtype=np.float32)
 
+            rem_global = None if max_step is None else max(0, int(max_step))
             for l_idx, layer in enumerate(layers):
                 path = layer.get("path", [])
                 total_lines = max(0, len(path) - 1)
-                # active_layer_idx < 0 означает режим «Все цвета / Все слои»
-                if max_step is None or active_layer_idx < 0:
+                # active_layer_idx < 0 означает режим «Все цвета / Все слои» с общим скроллингом шагов
+                if active_layer_idx < 0:
+                    if rem_global is None:
+                        draw_count = total_lines
+                    else:
+                        draw_count = min(total_lines, rem_global)
+                        rem_global -= draw_count
+                elif max_step is None:
                     draw_count = total_lines
                 elif l_idx < active_layer_idx:
                     draw_count = total_lines

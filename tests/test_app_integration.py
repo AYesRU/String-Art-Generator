@@ -214,35 +214,86 @@ class TestAppIntegration(unittest.TestCase):
                     proj_path,
                     app.state.get_config(),
                     app.state.layers,
-                    active_layer_idx=2,
+                    active_layer_idx=-1,
                     step_scrubber=10,
                     image_path=app.state.original_image_path,
                 )
                 proj = load_project_json(proj_path)
+                self.assertEqual(proj["active_layer_idx"], -1)
                 app.coordinator.apply_loaded_project(proj, source_path=proj_path)
                 app.update()
                 self.assertEqual(len(app.state.layers), 4)
                 self.assertEqual(len(app.state.layers[0]["path"]), 0)
-                self.assertEqual(app.state.active_layer_idx, 2)
+                self.assertEqual(app.state.active_layer_idx, -1)
                 self.assertEqual(int(app.state.safe_get("step_scrubber")), 10)
 
-            # Тест живого переключения языка RU -> EN -> RU без перезапуска
+            # Тест сквозного скроллинга шагов в режиме «Все цвета» (-1) и полного разрешения preview
+            app.redraw_target_canvas()
+            self.assertEqual(app.state.preprocessed_rgb_np.shape, (500, 500, 3))
+            cm = app.coordinator.canvas_manager
+            rgb_step1 = cm.render_layers_to_numpy(app.state.layers, output_size=120, max_step=1, active_layer_idx=-1)
+            rgb_full = cm.render_layers_to_numpy(app.state.layers, output_size=120, max_step=None, active_layer_idx=-1)
+            self.assertGreater(int(np.mean(rgb_step1)), int(np.mean(rgb_full)))
+
+            # Тест полного жизненного цикла адаптивного режима: синтез + ручной Prune + Polish + переключение языка на палитре
+            app.state.vars["color_mode"].set("Адаптивный подбор (N цветов)")
+            app.ui_manager._update_adaptive_n_visibility()
+            app.state.vars["adaptive_n_colors"].set(3)
+            app.state.vars["pins"].set(120)
+            app.state.vars["lines"].set(120)
+            app.state.vars["stages"].set(1)
+            app.state.vars["num_islands"].set(1)
+            app.state.vars["population_size"].set(4)
+            app.state.vars["memetic_depth"].set(4)
+            app.coordinator.start_generation()
+            deadline = time.time() + 30.0
+            while app.state.is_running and time.time() < deadline:
+                app.update()
+                time.sleep(0.03)
+            self.assertFalse(app.state.is_running, "Адаптивный синтез не завершился вовремя")
+            self.assertGreaterEqual(len(app.state.layers), 2)
+            adapt_names_before = [l["name"] for l in app.state.layers]
+            for nm in adapt_names_before:
+                self.assertNotEqual(nm, "Черная нить")
+
+            from unittest import mock as _mock
+            with _mock.patch("tkinter.messagebox.showinfo"):
+                app.coordinator.prune_chromosome(silent=False)
+            self.assertGreaterEqual(len(app.state.layers), 1)
+            self.assertNotIn("Черная нить", [l["name"] for l in app.state.layers])
+
+            app.state.active_layer_idx = -1
+            app.coordinator.start_evolution_only()
+            deadline = time.time() + 25.0
+            while app.state.is_running and time.time() < deadline:
+                app.update()
+                time.sleep(0.03)
+            self.assertFalse(app.state.is_running, "Адаптивная доводка не завершилась вовремя")
+            for nm in [l["name"] for l in app.state.layers]:
+                self.assertNotEqual(nm, "Черная нить")
+
+            # Тест живого переключения языка RU -> EN -> RU без перезапуска (включая чипы палитры)
             app.set_language("en", persist=False)
             app.update()
             self.assertEqual(app.state.lang, "en")
             self.assertEqual(app.ui_manager.widgets["start_button"].cget("text"), "▶ Start (CSR OMP + Islands)")
-            self.assertEqual(app.state.vars["color_mode"].get(), "Color CMYK (4 Threads)")
+            self.assertEqual(app.state.vars["color_mode"].get(), "Adaptive Color Matching (N colors)")
             self.assertEqual(app.state.vars["canvas_shape"].get(), "Circle")
+            pal_children = app.ui_manager._palette_frame.winfo_children()
+            self.assertGreaterEqual(len(pal_children), 2)
+            chip_texts = [w.cget("text") for w in pal_children[1].winfo_children()]
+            self.assertTrue(chip_texts)
+            self.assertTrue(all(not any("\u0400" <= ch <= "\u04ff" for ch in txt) for txt in chip_texts))
             cfg_en = app.state.get_config()
             self.assertEqual(cfg_en["language"], "en")
-            self.assertEqual(cfg_en["color_mode"], "Цветной CMYK (4 нити)")
+            self.assertEqual(cfg_en["color_mode"], "Адаптивный подбор (N цветов)")
             self.assertEqual(cfg_en["canvas_shape"], "Круг")
 
             app.set_language("ru", persist=False)
             app.update()
             self.assertEqual(app.state.lang, "ru")
             self.assertEqual(app.ui_manager.widgets["start_button"].cget("text"), "▶ Старт (CSR OMP + Острова)")
-            self.assertEqual(app.state.vars["color_mode"].get(), "Цветной CMYK (4 нити)")
+            self.assertEqual(app.state.vars["color_mode"].get(), "Адаптивный подбор (N цветов)")
         finally:
             app.coordinator.shutdown()
             app.audio_assistant.shutdown()

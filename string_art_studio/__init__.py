@@ -4,10 +4,10 @@ String Art Studio Pro — Hybrid CSR OMP + Island GA + Radon FBP + CUDA String A
 """
 
 __version__ = "9.9.0"
-APP_TITLE = f"String Art Studio Pro v{__version__[:3]}"
+APP_TITLE = f"String Art Studio Pro v{__version__}"
 
 IMAGE_SIZE = 500
-MIN_PIN_DISTANCE = 16
+MIN_PIN_DISTANCE = 16  # Legacy API constant; active engine uses compute_min_pin_distance(num_pins)
 PATIENCE_BASE = 22
 PATIENCE_STAGE_FACTOR = 14
 STAGNATION_MUTATION_FACTOR = 2.0
@@ -133,6 +133,7 @@ TOOLTIPS = {
     "gamma": "Гамма-коррекция (< 1.0 осветляет средние тона и убирает лишнюю грязь/кашу).",
     "canvas_shape": "Форма рамы для расположения гвоздей (Круг, Квадрат, Прямоугольник, Овал, Шестиугольник).",
     "color_mode": "Режим плетения: черная нить на белом, белая нить на темной доске, 4-слойный CMYK или Адаптивный подбор (N цветов из каталога).",
+    "adaptive_n_colors": "Количество цветов нитей (от 2 до 20), автоматически подбираемых из каталога 1017 оттенков под изображение.",
     "physical_diameter": "Физический размер/диаметр готовой картины (в см) для точного расчета расхода нити и G-Code.",
     "pins": "Количество гвоздей по периметру.\nРекомендуется: 240-320.",
     "lines": "Максимальное количество нитей на слой.\nАлгоритм автоматически уменьшает число нитей при избытке (вплоть до 0 для отсутствующих цветов) и добавляет при нехватке в пределах максимума.",

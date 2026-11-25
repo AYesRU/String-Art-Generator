@@ -250,12 +250,24 @@ class EvolutionCoordinator:
                     ]
 
                 active_chord = None
-                if show_active and active_layer_idx < len(layers_data):
+                if show_active and 0 <= active_layer_idx < len(layers_data):
                     p = layers_data[active_layer_idx].get("path", [])
                     total_l = len(p) - 1
                     step_idx = total_l if max_step is None else min(total_l, max(1, int(max_step)))
                     if 0 < step_idx < len(p) and max_step is not None and max_step < total_l:
                         active_chord = (p[step_idx - 1], p[step_idx])
+                elif show_active and active_layer_idx < 0 and max_step is not None:
+                    total_all = sum(max(0, len(l.get("path", [])) - 1) for l in layers_data)
+                    if 0 < max_step < total_all:
+                        rem = max(1, int(max_step))
+                        for lyr in layers_data:
+                            p = lyr.get("path", [])
+                            cnt = max(0, len(p) - 1)
+                            if rem <= cnt:
+                                if cnt >= 1:
+                                    active_chord = (p[rem - 1], p[rem])
+                                break
+                            rem -= cnt
 
                 img_pil = self.canvas_manager.render_layers_to_pil(
                     layers_data,
@@ -273,15 +285,46 @@ class EvolutionCoordinator:
                 now = time.perf_counter()
                 if (
                     key == "overall"
-                    and self.active_fitness_calc is not None
                     and (now - self._last_analytic_map_time > 0.45 or render_params.get("force_maps"))
                 ):
-                    self._last_analytic_map_time = now
-                    _ali = active_layer_idx if active_layer_idx < len(layers_data) else 0
-                    path_main = layers_data[_ali].get("path", []) if layers_data else []
-                    if len(path_main) >= 2:
-                        _, diff_map, depth_2d = self.active_fitness_calc.calculate_single_fitness_and_maps(path_main)
-                        self._push_analytic_maps(diff_map, depth_2d)
+                    if 0 <= active_layer_idx < len(layers_data) and self.active_fitness_calc is not None:
+                        self._last_analytic_map_time = now
+                        path_main = layers_data[active_layer_idx].get("path", [])
+                        if len(path_main) >= 2:
+                            _, diff_map, depth_2d = self.active_fitness_calc.calculate_single_fitness_and_maps(path_main)
+                            self._push_analytic_maps(diff_map, depth_2d)
+                    elif active_layer_idx < 0 and layers_data and self.canvas_manager.flat_ready:
+                        flat_size = self.canvas_manager.size * self.canvas_manager.size
+                        depth_comp = np.zeros(flat_size, dtype=np.float32)
+                        for lyr in layers_data:
+                            p = lyr.get("path", [])
+                            tot_l = max(0, len(p) - 1)
+                            if tot_l == 0:
+                                continue
+                            ref_n = max(400, int(lyr.get("ref_lines") or tot_l))
+                            alpha_l = self.canvas_manager.get_line_alpha(ref_n, line_weight)
+                            hex_c = str(lyr.get("color_hex", "#111111")).lstrip("#")
+                            if len(hex_c) == 6:
+                                try:
+                                    rgb_c = [int(hex_c[i : i + 2], 16) / 255.0 for i in (0, 2, 4)]
+                                except ValueError:
+                                    rgb_c = [0.0, 0.0, 0.0]
+                            else:
+                                rgb_c = [0.0, 0.0, 0.0]
+                            mean_abs = (1.0 - (sum(rgb_c) / 3.0)) if not invert_board else (sum(rgb_c) / 3.0)
+                            depth_comp += self.canvas_manager.compute_optical_depth_1d(p, alpha_l) * max(0.05, mean_abs)
+                        depth_2d = depth_comp.reshape((self.canvas_manager.size, self.canvas_manager.size))
+                        tgt_np = self.state.preprocessed_target_np
+                        if tgt_np is not None and tgt_np.shape == depth_2d.shape:
+                            self._last_analytic_map_time = now
+                            tgt_d = (
+                                (tgt_np.astype(np.float32) / 255.0)
+                                if invert_board
+                                else ((255.0 - tgt_np.astype(np.float32)) / 255.0)
+                            )
+                            cur_d = np.clip(1.0 - np.exp(-depth_2d * 1.6), 0.0, 1.0)
+                            diff_map = (tgt_d - cur_d).astype(np.float32)
+                            self._push_analytic_maps(diff_map, depth_2d)
             except Exception:
                 logging.error("Ошибка в потоке рендеринга", exc_info=True)
 
@@ -300,12 +343,92 @@ class EvolutionCoordinator:
     def _t(self, key: str, **kwargs) -> str:
         return tr(key, self.state.lang, **kwargs)
 
+    @staticmethod
+    def _parse_hex_rgb_0_255(hex_color: str) -> List[int]:
+        h = str(hex_color or "#111111").lstrip("#")
+        if len(h) == 6:
+            try:
+                return [int(h[i : i + 2], 16) for i in (0, 2, 4)]
+            except ValueError:
+                pass
+        return [17, 17, 17]
+
+    @staticmethod
+    def _preprocess_rgb_for_adaptive(rgb_img: np.ndarray, config: Dict[str, Any], invert_board: bool) -> np.ndarray:
+        rgb_smooth = cv2.bilateralFilter(rgb_img, d=5, sigmaColor=18, sigmaSpace=18)
+        gamma_val = float(config.get("gamma", 1.0))
+        if abs(gamma_val - 1.0) > 0.03:
+            inv_gamma = 1.0 / max(0.1, gamma_val) if not invert_board else gamma_val
+            table = np.array([((i / 255.0) ** inv_gamma) * 255.0 for i in range(256)], dtype=np.uint8)
+            rgb_smooth = cv2.LUT(rgb_smooth, table)
+        return rgb_smooth
+
+    def _compute_adaptive_budgets(
+        self,
+        channel_densities: List[np.ndarray],
+        mask: np.ndarray,
+        cm: CanvasManager,
+        max_lines: int,
+        line_weight: int,
+    ) -> Tuple[List[int], List[int]]:
+        phys_budgets = [
+            estimate_channel_line_budget(d_map, mask, cm, max_lines, line_weight)
+            for d_map in channel_densities
+        ]
+        total_phys = sum(phys_budgets)
+        budget_cap = int(round(max_lines * 1.60))
+        if total_phys > budget_cap and total_phys > 0:
+            scale_b = budget_cap / float(total_phys)
+            ch_budgets = [
+                max(30, min(max_lines, int(round(b * scale_b)))) if b >= 15 else 0
+                for b in phys_budgets
+            ]
+        else:
+            ch_budgets = list(phys_budgets)
+        return phys_budgets, ch_budgets
+
+    def _build_channels_for_existing_layers(
+        self, bundle: Dict[str, Any], config: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Восстанавливает целевые каналы плотности под текущие слои проекта (Mono / Dark / CMYK / Adaptive)."""
+        is_adaptive = "Адаптивный" in str(config.get("color_mode", ""))
+        if not is_adaptive or not self.state.layers:
+            return bundle["channels"]
+
+        invert_board = bool(bundle.get("invert_board", False))
+        mask = bundle.get("mask", np.ones_like(bundle["gray"], dtype=np.uint8) * 255)
+        palette = [
+            {
+                "name": str(l.get("name", f"Цвет {i + 1}")),
+                "hex": str(l.get("color_hex", "#111111")),
+                "rgb": self._parse_hex_rgb_0_255(str(l.get("color_hex", "#111111"))),
+            }
+            for i, l in enumerate(self.state.layers)
+        ]
+        rgb_smooth = self._preprocess_rgb_for_adaptive(bundle["rgb"], config, invert_board)
+        rgb_norm = np.clip(rgb_smooth.astype(np.float32) / 255.0, 0.0, 1.0)
+        densities = self._decompose_adaptive_channels(rgb_norm, palette, mask, invert_board=invert_board)
+        res: List[Dict[str, Any]] = []
+        for l, d_map in zip(self.state.layers, densities):
+            edg, imp = _compute_channel_edges_and_importance(d_map, mask, boost=1.1)
+            res.append({
+                "name": str(l.get("name", "Слой")),
+                "color_hex": str(l.get("color_hex", "#111111")),
+                "darkness": d_map,
+                "importance": imp,
+                "edges": edg,
+            })
+        return res
+
     def start_evolution_only(self) -> None:
         """Запуск параллельной островной эволюции на текущем пути без перезапуска OMP."""
         if self.state.original_image is None:
             messagebox.showwarning(self._t("dlg_warn"), self._t("msg_load_first"))
             return
-        if not self.state.overall_best_chromosome or len(self.state.overall_best_chromosome) < 4:
+        has_base = any(len(l.get("path", [])) >= 4 for l in self.state.layers) or bool(
+            self.state.overall_best_chromosome and len(self.state.overall_best_chromosome) >= 4
+        )
+        if not has_base:
             messagebox.showinfo(self._t("dlg_info"), self._t("msg_no_base_path"))
             self.start_generation()
             return
@@ -342,19 +465,93 @@ class EvolutionCoordinator:
             self.state.preprocessed_rgb_np = bundle["rgb"]
 
             cm = self._ensure_canvas_manager(config)
-            active_idx = min(self.state.active_layer_idx, len(bundle["channels"]) - 1)
-            ch_data = bundle["channels"][max(0, active_idx)]
-            ch_edges = ch_data.get("edges", bundle["edges"])
-            is_cmyk = len(bundle["channels"]) > 1
-            layer_max_lines = (
-                estimate_channel_line_budget(
-                    ch_data["darkness"], bundle["mask"], cm, config["lines"], config["line_weight"]
-                )
-                if is_cmyk
-                else int(config["lines"])
-            )
+            channels = self._build_channels_for_existing_layers(bundle, config)
+            is_adaptive = "Адаптивный" in str(config.get("color_mode", ""))
+            max_lines = int(config["lines"])
+            line_weight = int(config.get("line_weight", 72))
 
-            if self.radon_guide is None and config.get("radon_enabled", True) and layer_max_lines > 0:
+            if is_adaptive and len(channels) > 1:
+                _, layer_budgets = self._compute_adaptive_budgets(
+                    [ch["darkness"] for ch in channels], bundle["mask"], cm, max_lines, line_weight
+                )
+            elif len(channels) > 1:
+                layer_budgets = [
+                    estimate_channel_line_budget(ch["darkness"], bundle["mask"], cm, max_lines, line_weight)
+                    for ch in channels
+                ]
+            else:
+                layer_budgets = [max_lines]
+
+            radon_enabled = bool(config.get("radon_enabled", True))
+            is_multi = len(self.state.layers) > 1 and len(channels) == len(self.state.layers)
+
+            if is_multi and self.state.active_layer_idx < 0:
+                adapt_stages = max(2, config.get("stages", 5) // 2)
+                for idx in range(len(self.state.layers)):
+                    if self.omp_stop_flag:
+                        break
+                    ch_data = channels[idx]
+                    bud = layer_budgets[idx]
+                    base_p = list(self.state.layers[idx].get("path", []))
+                    if bud <= 0 or len(base_p) < 2:
+                        continue
+                    ch_edges = ch_data.get("edges", bundle["edges"])
+                    ch_radon = (
+                        RadonGuide(
+                            bundle["gray"], ch_edges, cm, config, compute_fbp=False, density_override=ch_data["darkness"]
+                        )
+                        if radon_enabled
+                        else None
+                    )
+                    fc = FitnessCalculator(
+                        bundle["gray"], ch_edges, bundle["saliency"], ch_data["importance"],
+                        cm, config, self.queues, target_darkness_override=ch_data["darkness"],
+                    )
+                    self.active_fitness_calc = fc
+                    self.state.omp_baseline_fitness = fc.calculate_single_fitness(base_p)
+                    self.state.layer_best_fitnesses[idx] = self.state.omp_baseline_fitness - 1e-6
+                    disp_name = translate_layer_name(ch_data["name"], lang)
+                    self._send_status(tr("st_start_islands", lang, n=config["num_islands"], max_l=bud), run_id=run_id)
+                    mgr = IslandManagerThread(
+                        config, self.queues, fc, base_p, ch_radon,
+                        layer_idx=idx, layer_name=disp_name, emit_done=False,
+                        stages_override=adapt_stages, patience_scale=0.55,
+                        run_id=run_id, max_lines=bud,
+                    )
+                    self.manager_thread = mgr
+                    mgr.start()
+                    mgr.join()
+                    if mgr.best_result is not None and len(mgr.best_result.get("chromosome", [])) >= 2:
+                        self.state.layers[idx]["path"] = list(mgr.best_result["chromosome"])
+
+                done_msg = (
+                    tr("st_stopped_user", lang)
+                    if self.omp_stop_flag
+                    else (
+                        tr("st_adaptive_done", lang, n=len(self.state.layers))
+                        if is_adaptive
+                        else tr("st_cmyk_done", lang)
+                    )
+                )
+                self.queues["status_queue"].put({"type": "done", "run_id": run_id, "data": done_msg})
+                return
+
+            active_idx = max(0, min(self.state.active_layer_idx, len(channels) - 1))
+            ch_data = channels[active_idx]
+            ch_edges = ch_data.get("edges", bundle["edges"])
+            layer_max_lines = layer_budgets[active_idx]
+
+            # Для многослойных режимов строим Радон строго под активный канал (а не кеш от другого слоя)
+            if len(channels) > 1 and radon_enabled and layer_max_lines > 0:
+                self.radon_guide = RadonGuide(
+                    bundle["gray"],
+                    ch_edges,
+                    cm,
+                    config,
+                    compute_fbp=False,
+                    density_override=ch_data["darkness"],
+                )
+            elif self.radon_guide is None and radon_enabled and layer_max_lines > 0:
                 self.radon_guide = RadonGuide(
                     bundle["gray"],
                     ch_edges,
@@ -375,7 +572,10 @@ class EvolutionCoordinator:
                 target_darkness_override=ch_data["darkness"],
             )
             self.active_fitness_calc = fc
-            base_chromosome = list(self.state.overall_best_chromosome or [])
+            if active_idx < len(self.state.layers):
+                base_chromosome = list(self.state.layers[active_idx].get("path", []))
+            else:
+                base_chromosome = list(self.state.overall_best_chromosome or [])
             disp_name = translate_layer_name(ch_data["name"], lang)
             if layer_max_lines == 0:
                 self.queues["status_queue"].put({
@@ -732,20 +932,14 @@ class EvolutionCoordinator:
             elif is_adaptive:
                 n_colors = max(2, min(20, int(config.get("adaptive_n_colors", 5))))
                 self._send_status(tr("st_adaptive_selecting", lang, n=n_colors, total=len(COLOR_CATALOG)), run_id=run_id)
-                rgb_img = self.state.preprocessed_rgb_np if self.state.preprocessed_rgb_np is not None else np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), np.uint8)
+                rgb_img = bundle["rgb"] if bundle.get("rgb") is not None else np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), np.uint8)
                 mask = bundle.get("mask", np.ones_like(bundle["gray"], dtype=np.uint8) * 255)
                 invert_board = bool(bundle.get("invert_board", False))
                 max_lines = int(config["lines"])
                 line_weight = int(config.get("line_weight", 72))
 
                 # Предобработка исходного изображения под цветоделение (сглаживание шума и гамма)
-                rgb_smooth = cv2.bilateralFilter(rgb_img, d=5, sigmaColor=18, sigmaSpace=18)
-                gamma_val = float(config.get("gamma", 1.0))
-                if abs(gamma_val - 1.0) > 0.03:
-                    inv_gamma = 1.0 / max(0.1, gamma_val) if not invert_board else gamma_val
-                    table = np.array([((i / 255.0) ** inv_gamma) * 255.0 for i in range(256)], dtype=np.uint8)
-                    rgb_smooth = cv2.LUT(rgb_smooth, table)
-
+                rgb_smooth = self._preprocess_rgb_for_adaptive(rgb_img, config, invert_board)
                 rgb_norm = np.clip(rgb_smooth.astype(np.float32) / 255.0, 0.0, 1.0)
 
                 # 1) Подбор N информативных цветов из каталога с гарантированным покрытием областей изображения
@@ -757,20 +951,9 @@ class EvolutionCoordinator:
 
                 # 3) Оценка физической потребности каждого слоя (с учетом запаса 1.8x внутри estimate_channel_line_budget,
                 #    так как OMP авто-стоп и дельта-прунинг оставляют ~55-65% от верхнего лимита ch_budget)
-                phys_budgets = [
-                    estimate_channel_line_budget(d_map, mask, cm, max_lines, line_weight)
-                    for d_map in channel_densities
-                ]
-                total_phys = sum(phys_budgets)
-                budget_cap = int(round(max_lines * 1.60))
-                if total_phys > budget_cap and total_phys > 0:
-                    scale_b = budget_cap / float(total_phys)
-                    ch_budgets = [
-                        max(30, min(max_lines, int(round(b * scale_b)))) if b >= 15 else 0
-                        for b in phys_budgets
-                    ]
-                else:
-                    ch_budgets = list(phys_budgets)
+                phys_budgets, ch_budgets = self._compute_adaptive_budgets(
+                    channel_densities, mask, cm, max_lines, line_weight
+                )
 
                 logging.info(
                     "Адаптивный режим (%d цв.): физ. потребность=%s, бюджеты=%s (сумма=%d при лимите=%d)",
@@ -847,7 +1030,7 @@ class EvolutionCoordinator:
                         accumulated_layers.append({"name": name_ru, "color_hex": hex_c, "path": base_path, "ref_lines": max_lines})
                         self.queues["status_queue"].put({
                             "type": "greedy_update", "run_id": run_id,
-                            "data": {"text": f"{disp_name}: готово ({n_done} нитей)", "layers": list(accumulated_layers), "active_idx": len(accumulated_layers) - 1},
+                            "data": {"text": tr("st_cmyk_layer_done", lang, name=disp_name, lines=n_done), "layers": list(accumulated_layers), "active_idx": len(accumulated_layers) - 1},
                         })
                     else:
                         logging.info(f"Слой '{disp_name}' не получил нитей (0 линий) и был исключен.")
@@ -857,7 +1040,7 @@ class EvolutionCoordinator:
                     {
                         "name": l["name"],
                         "hex": l["color_hex"],
-                        "rgb": [int(l["color_hex"].lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)] if len(l.get("color_hex", "").lstrip("#")) == 6 else [50, 50, 50],
+                        "rgb": self._parse_hex_rgb_0_255(l.get("color_hex", "#333333")),
                     }
                     for l in accumulated_layers
                 ]
@@ -936,7 +1119,6 @@ class EvolutionCoordinator:
             valid_indices = list(range(len(COLOR_CATALOG)))
 
         cand_lab = cat_lab[valid_indices]
-        cand_rgb = cat_rgb[valid_indices]
         cand_colors = [COLOR_CATALOG[i] for i in valid_indices]
 
         # Извлечение всех пигментированных пикселей и восстановление их собственного цвета нити (de-tinted Beer-Lambert ink color):
@@ -1318,7 +1500,7 @@ class EvolutionCoordinator:
             self.state.layer_best_fitnesses[layer_idx] = fitness
             self.state.overall_best_fitness = fitness
             self.state.overall_best_chromosome = list(chromosome)
-            if layer_idx < len(self.state.layers):
+            if 0 <= layer_idx < len(self.state.layers):
                 self.state.layers[layer_idx]["path"] = list(chromosome)
             elif layer_idx == len(self.state.layers):
                 invert = self.state.is_invert_board()
@@ -1383,18 +1565,27 @@ class EvolutionCoordinator:
         removed = self.prune_chromosome(silent=True)
         # Если активный слой оказался пустым (например, отсутствующий цвет CMYK), переключаемся на последний непустой
         if self.state.layers:
-            cur_idx = min(self.state.active_layer_idx, len(self.state.layers) - 1)
-            if len(self.state.layers[cur_idx].get("path", [])) < 2:
-                non_empty = [i for i, l in enumerate(self.state.layers) if len(l.get("path", [])) >= 2]
-                if non_empty:
-                    self.state.active_layer_idx = non_empty[-1]
-                    active_p = self.state.layers[self.state.active_layer_idx]["path"]
-                    self.state.overall_best_chromosome = list(active_p)
-                    max_steps = max(1, len(active_p) - 1)
-                    scale = self.ui_manager.widgets.get("step_scrubber_scale")
-                    if isinstance(scale, ttk.Scale):
-                        scale.configure(to=max(10, max_steps))
-                    self.state.vars["step_scrubber"].set(max_steps)
+            if self.state.active_layer_idx < 0:
+                if len(self.state.layers) <= 1:
+                    self.state.active_layer_idx = 0
+                total_all = max(1, sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers))
+                scale = self.ui_manager.widgets.get("step_scrubber_scale")
+                if isinstance(scale, ttk.Scale):
+                    scale.configure(to=max(10, total_all))
+                self.state.vars["step_scrubber"].set(total_all)
+            else:
+                cur_idx = min(self.state.active_layer_idx, len(self.state.layers) - 1)
+                if len(self.state.layers[cur_idx].get("path", [])) < 2:
+                    non_empty = [i for i, l in enumerate(self.state.layers) if len(l.get("path", [])) >= 2]
+                    if non_empty:
+                        self.state.active_layer_idx = non_empty[-1]
+                        active_p = self.state.layers[self.state.active_layer_idx]["path"]
+                        self.state.overall_best_chromosome = list(active_p)
+                        max_steps = max(1, len(active_p) - 1)
+                        scale = self.ui_manager.widgets.get("step_scrubber_scale")
+                        if isinstance(scale, ttk.Scale):
+                            scale.configure(to=max(10, max_steps))
+                        self.state.vars["step_scrubber"].set(max_steps)
 
         self._finalize_run()
         self.ui_manager.update_layer_selector()
@@ -1471,6 +1662,7 @@ class EvolutionCoordinator:
 
         total_removed = 0
         total_added = 0
+        removed_empty_layers = False
 
         if not silent and self.state.original_image is not None and self.state.layers:
             # Ручной запуск: удаляем петли + избыточные перетемняющие нити через точный O(L) дельта-анализ
@@ -1484,7 +1676,22 @@ class EvolutionCoordinator:
                 shape=config["canvas_shape"],
                 color_mode=config["color_mode"],
             )
-            channels = bundle["channels"]
+            channels = self._build_channels_for_existing_layers(bundle, config)
+            is_adaptive = "Адаптивный" in str(config.get("color_mode", ""))
+            max_lines = int(config["lines"])
+            line_weight = int(config.get("line_weight", 72))
+            if is_adaptive and len(channels) > 1:
+                _, layer_budgets = self._compute_adaptive_budgets(
+                    [ch["darkness"] for ch in channels], bundle["mask"], cm, max_lines, line_weight
+                )
+            elif len(channels) > 1:
+                layer_budgets = [
+                    estimate_channel_line_budget(ch["darkness"], bundle["mask"], cm, max_lines, line_weight)
+                    for ch in channels
+                ]
+            else:
+                layer_budgets = [max_lines]
+
             for l_idx, layer in enumerate(self.state.layers):
                 path = layer.get("path", [])
                 if l_idx < len(channels):
@@ -1499,11 +1706,7 @@ class EvolutionCoordinator:
                         self.queues,
                         target_darkness_override=ch["darkness"],
                     )
-                    max_l = (
-                        estimate_channel_line_budget(ch["darkness"], bundle["mask"], cm, config["lines"], config["line_weight"])
-                        if len(channels) > 1
-                        else int(config["lines"])
-                    )
+                    max_l = layer_budgets[l_idx]
                     opt_p, _, rem, add = optimize_thread_count_delta(path, fc, max_l, allow_add=False)
                     layer["path"] = opt_p
                     total_removed += rem
@@ -1512,8 +1715,35 @@ class EvolutionCoordinator:
                     pruned, rem = prune_chromosome_loops(path)
                     layer["path"] = pruned
                     total_removed += rem
-                if l_idx == self.state.active_layer_idx:
-                    self.state.overall_best_chromosome = layer["path"]
+
+            if is_adaptive:
+                kept = [l for l in self.state.layers if len(l.get("path", [])) >= 2]
+                if len(kept) != len(self.state.layers):
+                    removed_empty_layers = True
+                    self.state.layers = kept
+                    if self.state.active_layer_idx < 0:
+                        if len(kept) <= 1:
+                            self.state.active_layer_idx = 0
+                    elif self.state.layers:
+                        self.state.active_layer_idx = min(self.state.active_layer_idx, len(self.state.layers) - 1)
+                    else:
+                        self.state.active_layer_idx = 0
+                    pal = [
+                        {
+                            "name": l["name"],
+                            "hex": l["color_hex"],
+                            "rgb": self._parse_hex_rgb_0_255(l.get("color_hex", "#333333")),
+                        }
+                        for l in self.state.layers
+                    ]
+                    self.ui_manager.update_palette(pal)
+                self.ui_manager.update_layer_selector()
+
+            if self.state.layers:
+                if 0 <= self.state.active_layer_idx < len(self.state.layers):
+                    self.state.overall_best_chromosome = list(self.state.layers[self.state.active_layer_idx].get("path", []))
+                else:
+                    self.state.overall_best_chromosome = list(self.state.layers[-1].get("path", []))
         elif self.state.layers:
             for l_idx, layer in enumerate(self.state.layers):
                 pruned, rem = prune_chromosome_loops(layer.get("path", []))
@@ -1521,17 +1751,23 @@ class EvolutionCoordinator:
                 total_removed += rem
                 if l_idx == self.state.active_layer_idx:
                     self.state.overall_best_chromosome = pruned
+            if self.state.active_layer_idx < 0 and self.state.layers:
+                self.state.overall_best_chromosome = list(self.state.layers[-1].get("path", []))
         elif self.state.overall_best_chromosome:
             pruned, total_removed = prune_chromosome_loops(self.state.overall_best_chromosome)
             self.state.overall_best_chromosome = pruned
 
-        if total_removed > 0 or total_added > 0:
-            active_path = self.state.overall_best_chromosome or []
-            max_steps = max(1, len(active_path) - 1)
+        if total_removed > 0 or total_added > 0 or removed_empty_layers:
+            if self.state.layers and self.state.active_layer_idx < 0:
+                max_steps = max(1, sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers))
+            else:
+                active_path = self.state.overall_best_chromosome or []
+                max_steps = max(1, len(active_path) - 1)
             scale = self.ui_manager.widgets.get("step_scrubber_scale")
             if isinstance(scale, ttk.Scale):
                 scale.configure(to=max(10, max_steps))
             self.state.vars["step_scrubber"].set(max_steps)
+            self.ui_manager.update_layer_selector()
             self.ui_manager.update_player_step_label()
 
             if self.state.layers:
@@ -1630,8 +1866,13 @@ class EvolutionCoordinator:
             }
             for i, l in enumerate(proj["layers"])
         ]
-        self.state.active_layer_idx = max(0, min(len(self.state.layers) - 1, int(proj.get("active_layer_idx", 0))))
-        active_path = self.state.layers[self.state.active_layer_idx]["path"]
+        raw_ali = int(proj.get("active_layer_idx", 0))
+        if raw_ali < 0 and len(self.state.layers) > 1:
+            self.state.active_layer_idx = -1
+            active_path = self.state.layers[-1]["path"]
+        else:
+            self.state.active_layer_idx = max(0, min(len(self.state.layers) - 1, raw_ali))
+            active_path = self.state.layers[self.state.active_layer_idx]["path"]
         self.state.overall_best_chromosome = list(active_path)
 
         img_path = proj.get("image_path") or ""
@@ -1659,7 +1900,10 @@ class EvolutionCoordinator:
         self.radon_guide = None
         self.active_fitness_calc = None
 
-        max_steps = max(1, len(active_path) - 1)
+        if self.state.active_layer_idx < 0:
+            max_steps = max(1, sum(max(0, len(l["path"]) - 1) for l in self.state.layers))
+        else:
+            max_steps = max(1, len(active_path) - 1)
         step_val = max(1, min(max_steps, int(proj.get("step_scrubber", max_steps))))
         scale = self.ui_manager.widgets.get("step_scrubber_scale")
         if isinstance(scale, ttk.Scale):
@@ -1668,6 +1912,19 @@ class EvolutionCoordinator:
 
         self.best_chromosomes_by_key["overall"] = list(self.state.layers)
         self.ui_manager.update_title()
+        self.ui_manager._update_adaptive_n_visibility()
+        if "Адаптивный" in str(config.get("color_mode", "")):
+            pal = [
+                {
+                    "name": l["name"],
+                    "hex": l["color_hex"],
+                    "rgb": self._parse_hex_rgb_0_255(l.get("color_hex", "#333333")),
+                }
+                for l in self.state.layers
+            ]
+            self.ui_manager.update_palette(pal)
+        else:
+            self.ui_manager.update_palette([])
         self.ui_manager.update_layer_selector()
         self.ui_manager.update_player_step_label()
         total_m = sum(cm.calculate_path_length_m(l["path"]) for l in self.state.layers)

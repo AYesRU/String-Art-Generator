@@ -221,18 +221,20 @@ def translate_layer_name(name: str, lang: str) -> str:
 
 
 def layer_short_code(name: str, lang: str) -> str:
-    low = name.lower()
-    if "cyan" in low or "циан" in low:
-        return "C" if normalize_lang(lang) == "en" else "Ц"
-    if "magenta" in low or "маджент" in low:
-        return "M" if normalize_lang(lang) == "en" else "М"
-    if "yellow" in low or "желт" in low:
-        return "Y" if normalize_lang(lang) == "en" else "Ж"
-    if "black" in low or "черн" in low:
-        return "K" if normalize_lang(lang) == "en" else "Ч"
-    if "white" in low or "бел" in low:
-        return "W" if normalize_lang(lang) == "en" else "Б"
-    return name[:1].upper() or "L"
+    is_en = normalize_lang(lang) == "en"
+    low = name.strip().lower()
+    if low in ("циан (cyan)", "cyan"):
+        return "C" if is_en else "Ц"
+    if low in ("маджента (magenta)", "magenta"):
+        return "M" if is_en else "М"
+    if low in ("желтый (yellow)", "yellow"):
+        return "Y" if is_en else "Ж"
+    if low in ("черный (black)", "black", "черная нить", "black thread"):
+        return "K" if is_en else "Ч"
+    if low in ("белая нить", "white thread"):
+        return "W" if is_en else "Б"
+    disp = translate_layer_name(name, lang).strip()
+    return disp[:3] or "L"
 
 
 # ----------------------------------------------------------------------
@@ -404,6 +406,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "all_colors_step": "Все цвета: шаг {step}/{total}",
         "palette_title": "Палитра нитей:",
         "st_done_adaptive_fmt": "{msg} ({per_layer} | Всего: {total})",
+        "kb_shortcuts_hint": "⌨ Пробел / D / → = Следующий шаг\n⌨ A / ← = Предыдущий шаг\n⌨ Панель управления плеером расположена под холстом ↓",
     },
     "en": {
         "dashboard_frame": "Evolution Dashboard & Algorithm Analytics",
@@ -569,6 +572,7 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "all_colors_step": "All colors: step {step}/{total}",
         "palette_title": "Thread Palette:",
         "st_done_adaptive_fmt": "{msg} ({per_layer} | Total: {total})",
+        "kb_shortcuts_hint": "⌨ Space / D / → = Next step\n⌨ A / ← = Prev step\n⌨ Player controls are in the bar below ↓",
     },
 }
 
@@ -582,6 +586,7 @@ TOOLTIPS_EN: Dict[str, str] = {
     "gamma": "Gamma correction (< 1.0 lightens midtones and prevents muddy over-darkening).",
     "canvas_shape": "Frame geometry for pin placement (Circle, Square, Rectangle, Oval, Hexagon).",
     "color_mode": "Weaving mode: Monochrome (black/white thread), 4-layer CMYK, or Adaptive color matching (N colors from catalog).",
+    "adaptive_n_colors": "Number of thread colors (2 to 20) automatically selected from the 1017-color catalog to match the image.",
     "physical_diameter": "Physical board size/diameter (cm) for accurate thread meterage and CNC G-Code.",
     "pins": "Number of perimeter pins.\nRecommended: 240–320.",
     "lines": "Maximum threads per layer.\nAutomatically reduces excess threads (down to 0 for absent colors) and adds up to max.",

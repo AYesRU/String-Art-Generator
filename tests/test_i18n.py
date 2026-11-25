@@ -10,6 +10,7 @@ from PIL import Image
 
 from string_art_studio import TOOLTIPS
 from string_art_studio.audio import AudioAssistant
+from string_art_studio.color_catalog import COLOR_CATALOG, COLOR_NAME_EN, COLOR_NAME_RU
 from string_art_studio.geometry import CanvasManager
 from string_art_studio.i18n import (
     COLOR_MODE_EN,
@@ -144,6 +145,27 @@ class TestI18n(unittest.TestCase):
         audio.set_language("ru")
         self.assertEqual(audio.lang, "ru")
         audio.shutdown()
+
+    def test_color_catalog_english_translations_and_short_codes(self):
+        self.assertEqual(len(COLOR_CATALOG), 1017)
+        cyr_re = re.compile(r"[\u0400-\u04ff]")
+        en_names = set()
+        for entry in COLOR_CATALOG:
+            ru_name = entry["name"]
+            en_name = entry.get("name_en", "")
+            self.assertTrue(en_name, f"Empty name_en for {ru_name}")
+            self.assertIsNone(cyr_re.search(en_name), f"Cyrillic left in name_en: {ru_name} -> {en_name}")
+            en_names.add(en_name)
+            self.assertEqual(COLOR_NAME_EN[ru_name], en_name)
+            self.assertEqual(COLOR_NAME_RU[en_name], ru_name)
+            self.assertEqual(translate_layer_name(ru_name, "en"), en_name)
+            if en_name not in LAYER_NAME_EN.values():
+                self.assertEqual(translate_layer_name(en_name, "ru"), ru_name)
+
+        self.assertEqual(len(en_names), len(COLOR_CATALOG), "Duplicate name_en entries in COLOR_CATALOG")
+        self.assertNotEqual(layer_short_code("Темный желтовато-коричневый", "ru"), "Ж")
+        code_en = layer_short_code("Темный желтовато-коричневый", "en")
+        self.assertIsNone(cyr_re.search(code_en))
 
 
 if __name__ == "__main__":

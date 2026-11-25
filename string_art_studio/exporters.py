@@ -32,7 +32,7 @@ def _slice_layer_path(
 ) -> List[int]:
     if not path:
         return []
-    if max_step is None:
+    if max_step is None or active_layer_idx < 0:
         return path
     if l_idx < active_layer_idx:
         return path
@@ -956,12 +956,15 @@ def load_project_json(filepath: str) -> Dict[str, Any]:
     if not isinstance(config, dict):
         config = {}
 
+    raw_ali = int(data.get("active_layer_idx", 0))
+    active_ali = -1 if (raw_ali < 0 and len(layers) > 1) else max(0, min(len(layers) - 1, raw_ali))
+
     return {
         "format": data["format"],
         "version": int(data.get("version", 1)),
         "app": str(data.get("app", APP_TITLE)),
         "image_path": str(data.get("image_path", "")),
-        "active_layer_idx": max(0, min(len(layers) - 1, int(data.get("active_layer_idx", 0)))),
+        "active_layer_idx": active_ali,
         "step_scrubber": max(1, int(data.get("step_scrubber", 1))),
         "config": config,
         "layers": layers,
