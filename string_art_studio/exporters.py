@@ -709,6 +709,11 @@ def build_interactive_html5_assistant(
     window.speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(TXT.speech_prefix + targetPin);
     u.lang = TXT.speech_lang;
+    const prefix2 = String(TXT.speech_lang || 'en').slice(0, 2).toLowerCase();
+    const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
+    const match = voices.find(v => String(v.lang || '').toLowerCase() === String(TXT.speech_lang || '').toLowerCase())
+      || voices.find(v => String(v.lang || '').toLowerCase().startsWith(prefix2));
+    if (match) u.voice = match;
     u.rate = 1.15;
     window.speechSynthesis.speak(u);
   }}

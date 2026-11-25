@@ -2,6 +2,7 @@
 import os
 import re
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -9,7 +10,7 @@ import numpy as np
 from PIL import Image
 
 from string_art_studio import TOOLTIPS
-from string_art_studio.audio import AudioAssistant
+from string_art_studio.audio import SAPI_AVAILABLE, AudioAssistant, _detect_voice_lang
 from string_art_studio.color_catalog import (
     COLOR_CATALOG,
     COLOR_NAME_EN,
@@ -196,6 +197,50 @@ class TestI18n(unittest.TestCase):
         self.assertEqual(rgb_to_cmyk_pct(0, 0, 0), (0, 0, 0, 100))
         self.assertAlmostEqual(rgb_lightness_pct(0, 0, 0), 0.0, places=2)
         self.assertAlmostEqual(rgb_lightness_pct(255, 255, 255), 100.0, places=1)
+
+    def test_audio_voice_detection_and_switching(self):
+        class _DummyVoice:
+            def __init__(self, lang_attr, desc, vid=""):
+                self._lang = lang_attr
+                self._desc = desc
+                self.Id = vid
+
+            def GetAttribute(self, key):
+                return self._lang if key == "Language" else ""
+
+            def GetDescription(self):
+                return self._desc
+
+        self.assertEqual(_detect_voice_lang(_DummyVoice("419", "Microsoft Irina Desktop - Russian")), "ru")
+        self.assertEqual(_detect_voice_lang(_DummyVoice("409", "Microsoft Zira Desktop - English (United States)")), "en")
+        self.assertEqual(_detect_voice_lang(_DummyVoice("809;9", "Microsoft Hazel Desktop")), "en")
+        self.assertEqual(_detect_voice_lang(_DummyVoice("", "Some English Voice")), "en")
+        self.assertIsNone(_detect_voice_lang(_DummyVoice("407", "German Voice")))
+
+        if sys.platform == "win32" and SAPI_AVAILABLE:
+            audio = AudioAssistant(lang="en")
+            try:
+                deadline = time.time() + 3.0
+                while not audio.active_voice_desc and time.time() < deadline:
+                    time.sleep(0.05)
+                if audio.active_voice_desc:
+                    low_en = audio.active_voice_desc.lower()
+                    self.assertTrue(
+                        any(k in low_en for k in ("english", "zira", "david", "mark", "hazel", "en-")),
+                        f"Expected English SAPI voice, got: {audio.active_voice_desc}",
+                    )
+                audio.set_language("ru")
+                deadline = time.time() + 3.0
+                while audio.active_voice_desc and "irina" not in audio.active_voice_desc.lower() and "russian" not in audio.active_voice_desc.lower() and time.time() < deadline:
+                    time.sleep(0.05)
+                if audio.active_voice_desc:
+                    low_ru = audio.active_voice_desc.lower()
+                    self.assertTrue(
+                        any(k in low_ru for k in ("russian", "irina", "pavel", "ru-")),
+                        f"Expected Russian SAPI voice, got: {audio.active_voice_desc}",
+                    )
+            finally:
+                audio.shutdown()
 
 
 if __name__ == "__main__":
