@@ -5,6 +5,7 @@
 """
 
 import logging
+import math
 import os
 import queue
 import tempfile
@@ -32,6 +33,7 @@ from . import (
     TOOLTIPS,
 )
 from .audio import SAPI_AVAILABLE, AudioAssistant
+from .color_catalog import find_catalog_match, rgb_lightness_pct, rgb_to_cmyk_pct
 from .coordinator import AppState, EvolutionCoordinator
 from .engine import (
     CUDA_DEVICE_NAME,
@@ -40,6 +42,7 @@ from .engine import (
 )
 from .i18n import (
     LANGUAGE_LABELS,
+    LAYER_NAME_EN,
     get_display_color_modes,
     get_display_metrics,
     get_display_presets,
@@ -56,6 +59,7 @@ from .i18n import (
     to_display_preset,
     to_display_shape,
     tr,
+    translate_color_group,
     translate_layer_name,
 )
 from .preprocessing import auto_recommend_parameters, prepare_target_image_bundle
@@ -138,6 +142,14 @@ class UIManager:
         self.ax_mut: Optional[plt.Axes] = None
         self.chart_canvas: Optional[FigureCanvasTkAgg] = None
         self._last_palette_colors: List[Dict[str, Any]] = []
+        self._results_tab_keys: List[str] = []
+        self._palette_last_refresh_ts: float = 0.0
+        self._palette_cards_frame: Optional[tk.Frame] = None
+        self._palette_canvas: Optional[tk.Canvas] = None
+        self._palette_summary_frame: Optional[tk.Frame] = None
+        self._palette_bar_canvas: Optional[tk.Canvas] = None
+        self._palette_bar_items: List[Dict[str, Any]] = []
+        self._palette_feedback_label: Optional[tk.Label] = None
         self._i18n_widgets: List[Tuple[tk.Widget, str, str]] = []
         self._tooltips: List[Tuple[ToolTip, str]] = []
         self._last_thread_length_m: Optional[float] = None
@@ -288,18 +300,19 @@ class UIManager:
         self._create_player_bar(right_frame)
 
     def _on_tab_changed(self, _event=None) -> None:
-        if not self.coordinator:
+        notebook = self.widgets.get("results_notebook")
+        if not isinstance(notebook, ttk.Notebook):
             return
-        notebook = self.widgets["results_notebook"]
         sel = notebook.select()
         if not sel:
             return
         idx = notebook.index(sel)
-        if idx == 0:
-            self.on_result_canvas_resize(None, "overall")
-        elif 1 <= idx <= 4:
-            key = ["diff_map", "density_heatmap", "fit_saliency", "radon_sinogram"][idx - 1]
-            self.on_result_canvas_resize(None, key)
+        if 0 <= idx < len(self._results_tab_keys):
+            key = self._results_tab_keys[idx]
+            if key == "palette":
+                self.refresh_palette_tab()
+            elif self.coordinator:
+                self.on_result_canvas_resize(None, key)
 
     def _create_player_bar(self, parent: tk.Widget) -> None:
         """Creates the player control bar below the display area."""
@@ -539,14 +552,16 @@ class UIManager:
         self._add_tip(spn_n, "adaptive_n_colors")
         self.widgets["adaptive_n_spinbox"] = spn_n
 
-        # Визуальная палитра нитей (чипы выбранных цветов из каталога)
-        self._palette_frame = ttk.Frame(frame)
-        self._palette_frame.pack(fill=tk.X, pady=1)
-
         self._update_adaptive_n_visibility()
 
         self._create_slider_row(frame, "pins", "sl_pins", (60, 720))
-        self._create_double_slider_row(frame, "physical_diameter", "sl_physical_diameter", (10.0, 150.0))
+        self._create_double_slider_row(
+            frame,
+            "physical_diameter",
+            "sl_physical_diameter",
+            (10.0, 150.0),
+            command=self._on_physical_diameter_change,
+        )
         self._create_slider_row(frame, "lines", "sl_lines", (200, 10000))
         self._create_slider_row(frame, "line_weight", "sl_line_weight", (20, 100), command=self._on_visual_param_change)
         self._create_slider_row(frame, "thread_thickness", "sl_thread_thickness", (1, 6), command=self._on_visual_param_change)
@@ -923,6 +938,7 @@ class UIManager:
             tabs = notebook.tabs()
             tab_titles = [
                 self._t("tab_overall"),
+                self._t("tab_palette"),
                 self._t("tab_diff_map"),
                 self._t("tab_density"),
                 self._t("tab_saliency"),
@@ -943,8 +959,7 @@ class UIManager:
                 nb.tab(tab_id, text=tr(key, code))
 
         self.update_layer_selector()
-        if self._last_palette_colors:
-            self.update_palette(self._last_palette_colors)
+        self.refresh_palette_tab()
         self.update_player_step_label()
         self.update_title()
         self.update_chart()
@@ -991,62 +1006,668 @@ class UIManager:
     def _update_adaptive_n_visibility(self, *_) -> None:
         mode = to_canonical_color_mode(str(self.state.safe_get("color_mode") or ""))
         f_spin = getattr(self, "_adaptive_n_frame", None)
-        f_pal = getattr(self, "_palette_frame", None)
         is_adapt = "Адаптивный" in mode
         if f_spin:
             if is_adapt:
                 f_spin.pack(fill=tk.X, pady=1)
             else:
                 f_spin.pack_forget()
-        if f_pal:
-            if is_adapt:
-                f_pal.pack(fill=tk.X, pady=2)
+
+    @staticmethod
+    def _parse_hex_rgb(hex_c: str) -> Tuple[int, int, int]:
+        clean = str(hex_c or "#333333").strip().lstrip("#")
+        if len(clean) == 6:
+            try:
+                return (int(clean[0:2], 16), int(clean[2:4], 16), int(clean[4:6], 16))
+            except ValueError:
+                pass
+        return (50, 50, 50)
+
+    def _resolve_scaled_layer_length_m(self, path: List[int]) -> float:
+        cm = self.coordinator.canvas_manager if self.coordinator else None
+        if cm is None or not path or len(path) < 2:
+            return 0.0
+        base_m = cm.calculate_path_length_m(path)
+        cur_dia = float(self.state.safe_get("physical_diameter") or cm.physical_cm or 50.0)
+        scale = cur_dia / max(0.1, float(cm.physical_cm or 50.0))
+        return base_m * scale
+
+    def _on_physical_diameter_change(self, *_args) -> None:
+        if self.coordinator and self.coordinator.canvas_manager and self.state.layers:
+            total_m = sum(self._resolve_scaled_layer_length_m(l.get("path", [])) for l in self.state.layers)
+            self.update_thread_length_display(total_m)
+            self.refresh_palette_tab(throttle_s=0.1)
+
+    def _create_palette_tab(self, parent_notebook: ttk.Notebook) -> None:
+        """Создаёт отдельную вкладку подробной палитры и спецификации нитей в окне результата."""
+        tab = ttk.Frame(parent_notebook)
+        parent_notebook.add(tab, text=self._t("tab_palette"))
+        self.widgets["palette_tab_frame"] = tab
+
+        summary_frame = tk.Frame(tab, bg="#ffffff", highlightbackground="#d0d7de", highlightthickness=1)
+        summary_frame.pack(fill=tk.X, padx=6, pady=(6, 4))
+        self._palette_summary_frame = summary_frame
+
+        bar_canvas = tk.Canvas(tab, height=14, bg="#eaeef2", highlightthickness=1, highlightbackground="#d0d7de")
+        bar_canvas.pack(fill=tk.X, padx=6, pady=(0, 4))
+        bar_canvas.bind("<Configure>", lambda _e: self._draw_palette_proportion_bar())
+        self._palette_bar_canvas = bar_canvas
+
+        list_wrap = ttk.Frame(tab)
+        list_wrap.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+        canvas = tk.Canvas(list_wrap, bg="#f6f8fa", highlightthickness=0)
+        v_scroll = ttk.Scrollbar(list_wrap, orient="vertical", command=canvas.yview)
+        cards_frame = tk.Frame(canvas, bg="#f6f8fa")
+
+        cards_id = canvas.create_window((0, 0), window=cards_frame, anchor="nw")
+        canvas.configure(yscrollcommand=v_scroll.set)
+
+        def _on_cards_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(cards_id, width=max(300, event.width - 4))
+
+        def _on_mousewheel(event):
+            if canvas.winfo_height() < cards_frame.winfo_reqheight():
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        cards_frame.bind("<Configure>", _on_cards_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._palette_canvas = canvas
+        self._palette_cards_frame = cards_frame
+
+    def _collect_palette_items(self) -> List[Dict[str, Any]]:
+        """Собирает подробные цветовые, геометрические и расходные метрики по каждому цвету/слою."""
+        lang = normalize_lang(self.state.lang)
+        is_en = lang == "en"
+        total_pins = int(self.state.safe_get("pins") or 288)
+        items: List[Dict[str, Any]] = []
+
+        if self.state.layers:
+            total_lines = sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers)
+            for idx, layer in enumerate(self.state.layers):
+                raw_name = str(layer.get("name", f"Layer {idx + 1}" if is_en else f"Слой {idx + 1}"))
+                hex_c = str(layer.get("color_hex", "#111111")).upper()
+                r, g, b = self._parse_hex_rgb(hex_c)
+                path = layer.get("path", []) or []
+                lines = max(0, len(path) - 1)
+                cat_entry, delta_e = find_catalog_match(raw_name, (r, g, b))
+                name_disp = translate_layer_name(raw_name, lang)
+
+                other_name = ""
+                if not is_en:
+                    if raw_name in LAYER_NAME_EN:
+                        other_name = LAYER_NAME_EN[raw_name]
+                    elif cat_entry and delta_e == 0.0:
+                        other_name = str(cat_entry.get("name_en", ""))
+                    if other_name.strip().lower() == name_disp.strip().lower():
+                        other_name = ""
+
+                group_disp = translate_color_group(cat_entry.get("group", ""), lang) if cat_entry else ""
+                match_disp = ""
+                if cat_entry and delta_e > 0.0:
+                    match_disp = cat_entry.get("name_en", cat_entry["name"]) if is_en else cat_entry["name"]
+
+                cmyk = rgb_to_cmyk_pct(r, g, b)
+                lightness = rgb_lightness_pct(r, g, b)
+                length_m = self._resolve_scaled_layer_length_m(path)
+                length_res_m = length_m * 1.15
+                avg_chord_cm = (length_m * 100.0 / lines) if lines > 0 else 0.0
+                spools_500 = math.ceil(length_res_m / 500.0) if length_m > 0 else 0
+                spool_pct = (length_res_m / 500.0) * 100.0 if length_m > 0 else 0.0
+                skeins_8 = math.ceil(length_res_m / 8.0) if length_m > 0 else 0
+                share_pct = (100.0 * lines / total_lines) if total_lines > 0 else 0.0
+
+                items.append({
+                    "idx": idx,
+                    "has_layer": True,
+                    "pending": False,
+                    "is_active": self.state.active_layer_idx == idx,
+                    "raw_name": raw_name,
+                    "name": name_disp,
+                    "name_alt": other_name,
+                    "hex": hex_c,
+                    "rgb": (r, g, b),
+                    "cmyk": cmyk,
+                    "lightness": lightness,
+                    "group": group_disp,
+                    "catalog_match": match_disp,
+                    "delta_e": float(delta_e),
+                    "lines": lines,
+                    "share_pct": share_pct,
+                    "length_m": length_m,
+                    "length_res_m": length_res_m,
+                    "avg_chord_cm": avg_chord_cm,
+                    "spools_500": spools_500,
+                    "spool_pct": spool_pct,
+                    "skeins_8": skeins_8,
+                    "p_start": path[0] if lines > 0 else None,
+                    "p_end": path[-1] if lines > 0 else None,
+                    "uniq_pins": len(set(path)) if lines > 0 else 0,
+                    "total_pins": total_pins,
+                })
+        elif self._last_palette_colors:
+            for idx, col in enumerate(self._last_palette_colors):
+                raw_name = str(col.get("name", f"Color {idx + 1}" if is_en else f"Цвет {idx + 1}"))
+                hex_c = str(col.get("hex", "#333333")).upper()
+                rgb_list = col.get("rgb")
+                if rgb_list and len(rgb_list) >= 3:
+                    r, g, b = int(rgb_list[0]), int(rgb_list[1]), int(rgb_list[2])
+                else:
+                    r, g, b = self._parse_hex_rgb(hex_c)
+                cat_entry, delta_e = find_catalog_match(raw_name, (r, g, b))
+                name_disp = (
+                    str(col["name_en"])
+                    if (is_en and col.get("name_en"))
+                    else translate_layer_name(raw_name, lang)
+                )
+                other_name = ""
+                if not is_en:
+                    if cat_entry and delta_e == 0.0:
+                        other_name = str(cat_entry.get("name_en", ""))
+                    elif col.get("name_en"):
+                        other_name = str(col["name_en"])
+                    if other_name.strip().lower() == name_disp.strip().lower():
+                        other_name = ""
+                group_disp = translate_color_group(cat_entry.get("group", ""), lang) if cat_entry else ""
+                match_disp = ""
+                if cat_entry and delta_e > 0.0:
+                    match_disp = cat_entry.get("name_en", cat_entry["name"]) if is_en else cat_entry["name"]
+                items.append({
+                    "idx": idx,
+                    "has_layer": False,
+                    "pending": True,
+                    "is_active": False,
+                    "raw_name": raw_name,
+                    "name": name_disp,
+                    "name_alt": other_name,
+                    "hex": hex_c,
+                    "rgb": (r, g, b),
+                    "cmyk": rgb_to_cmyk_pct(r, g, b),
+                    "lightness": rgb_lightness_pct(r, g, b),
+                    "group": group_disp,
+                    "catalog_match": match_disp,
+                    "delta_e": float(delta_e),
+                    "lines": 0,
+                    "share_pct": 0.0,
+                    "length_m": 0.0,
+                    "length_res_m": 0.0,
+                    "avg_chord_cm": 0.0,
+                    "spools_500": 0,
+                    "spool_pct": 0.0,
+                    "skeins_8": 0,
+                    "p_start": None,
+                    "p_end": None,
+                    "uniq_pins": 0,
+                    "total_pins": total_pins,
+                })
+        return items
+
+    def _build_palette_text_spec(self, items: Optional[List[Dict[str, Any]]] = None) -> str:
+        """Формирует текстовую спецификацию палитры нитей для копирования в буфер обмена."""
+        if items is None:
+            items = self._collect_palette_items()
+        if not items:
+            return f"{self._t('pal_empty_title')}\n{self._t('pal_empty_hint')}"
+
+        mode_disp = str(self.state.safe_get("color_mode") or "")
+        shape_disp = str(self.state.safe_get("canvas_shape") or "")
+        pins = int(self.state.safe_get("pins") or 288)
+        dia = float(self.state.safe_get("physical_diameter") or 50.0)
+
+        active_colors = sum(1 for it in items if it["lines"] > 0 or it["pending"])
+        total_lines = sum(it["lines"] for it in items)
+        total_m = sum(it["length_m"] for it in items)
+        total_res_m = total_m * 1.15
+        total_spools = sum(it["spools_500"] for it in items)
+        total_skeins = sum(it["skeins_8"] for it in items)
+
+        out = [
+            self._t("pal_summary_header", mode=mode_disp),
+            self._t("pal_summary_meta", shape=shape_disp, pins=pins, dia=dia),
+            self._t("pal_kpi_colors", active=active_colors, total=len(items)),
+            self._t("pal_kpi_threads", threads=total_lines),
+            self._t("pal_kpi_length", m=total_m, m_res=total_res_m),
+            self._t("pal_kpi_spools", spools=total_spools, skeins=total_skeins),
+            "-" * 64,
+        ]
+        for it in items:
+            title = f"{it['idx'] + 1}. {it['name']}"
+            if it["name_alt"]:
+                title += f" ({it['name_alt']})"
+            if it["group"]:
+                title += f" [{it['group']}]"
+            out.append(title)
+            r, g, b = it["rgb"]
+            c, m, y, k = it["cmyk"]
+            out.append(
+                "   "
+                + self._t(
+                    "pal_codes_fmt",
+                    hex=it["hex"], r=r, g=g, b=b, c=c, m=m, y=y, k=k, l=it["lightness"],
+                )
+            )
+            if it["catalog_match"]:
+                out.append("   " + self._t("pal_catalog_match", name=it["catalog_match"], de=it["delta_e"]))
+            if it["pending"]:
+                out.append("   " + self._t("pal_threads_pending"))
+            elif it["lines"] == 0:
+                out.append("   " + self._t("pal_threads_zero"))
             else:
-                f_pal.pack_forget()
+                out.append("   " + self._t("pal_threads_fmt", lines=it["lines"], share=it["share_pct"]))
+                out.append(
+                    "   "
+                    + self._t(
+                        "pal_length_fmt",
+                        m=it["length_m"], m_res=it["length_res_m"], avg_cm=it["avg_chord_cm"],
+                    )
+                )
+                out.append(
+                    "   "
+                    + self._t(
+                        "pal_spools_fmt",
+                        spools=it["spools_500"], spool_pct=it["spool_pct"], skeins=it["skeins_8"],
+                    )
+                )
+                out.append(
+                    "   "
+                    + self._t(
+                        "pal_pins_fmt",
+                        p_start=it["p_start"],
+                        p_end=it["p_end"],
+                        uniq=it["uniq_pins"],
+                        total_pins=it["total_pins"],
+                    )
+                )
+        return "\n".join(out)
+
+    def _copy_palette_spec(self) -> None:
+        spec = self._build_palette_text_spec()
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(spec)
+        except tk.TclError:
+            pass
+        if self._palette_feedback_label:
+            self._palette_feedback_label.config(text=self._t("pal_copied_msg"), foreground="#0f5132")
+
+    def _copy_single_hex(self, hex_c: str, name: str) -> None:
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(hex_c)
+        except tk.TclError:
+            pass
+        if self._palette_feedback_label:
+            self._palette_feedback_label.config(
+                text=self._t("pal_hex_copied", hex=hex_c, name=name),
+                foreground="#0969da",
+            )
+
+    def _draw_palette_proportion_bar(self) -> None:
+        canvas = self._palette_bar_canvas
+        if not canvas:
+            return
+        canvas.delete("all")
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w <= 20 or h <= 4:
+            return
+        items = [it for it in self._palette_bar_items if it["lines"] > 0]
+        total = sum(it["lines"] for it in items)
+        if total <= 0:
+            canvas.create_rectangle(0, 0, w, h, fill="#e1e4e8", outline="")
+            return
+        cur_x = 0.0
+        for i, it in enumerate(items):
+            seg_w = (w * it["lines"] / float(total)) if i < len(items) - 1 else (w - cur_x)
+            next_x = min(float(w), cur_x + max(1.0, seg_w))
+            canvas.create_rectangle(cur_x, 0, next_x, h, fill=it["hex"], outline="#ffffff" if seg_w > 4 else "")
+            cur_x = next_x
+
+    def refresh_palette_tab(self, throttle_s: float = 0.0) -> None:
+        """Полностью перестраивает содержимое вкладки «Палитра нитей» с подробными характеристиками."""
+        if not self._palette_cards_frame or not self._palette_summary_frame:
+            return
+        now = time.monotonic()
+        if throttle_s > 0.0 and (now - self._palette_last_refresh_ts) < throttle_s:
+            return
+        self._palette_last_refresh_ts = now
+
+        for w in self._palette_summary_frame.winfo_children():
+            w.destroy()
+        for w in self._palette_cards_frame.winfo_children():
+            w.destroy()
+        self._palette_feedback_label = None
+
+        items = self._collect_palette_items()
+        self._palette_bar_items = items
+        self._draw_palette_proportion_bar()
+
+        if not items:
+            tk.Label(
+                self._palette_summary_frame,
+                text=self._t("pal_empty_title"),
+                font=("Segoe UI", 10, "bold"),
+                bg="#ffffff",
+                fg="#1f2328",
+                anchor="w",
+            ).pack(fill=tk.X, padx=10, pady=(8, 2))
+            tk.Label(
+                self._palette_summary_frame,
+                text=self._t("pal_empty_hint"),
+                font=("Segoe UI", 9),
+                bg="#ffffff",
+                fg="#57606a",
+                justify=tk.LEFT,
+                wraplength=620,
+                anchor="w",
+            ).pack(fill=tk.X, padx=10, pady=(0, 10))
+            return
+
+        mode_disp = str(self.state.safe_get("color_mode") or "")
+        shape_disp = str(self.state.safe_get("canvas_shape") or "")
+        pins = int(self.state.safe_get("pins") or 288)
+        dia = float(self.state.safe_get("physical_diameter") or 50.0)
+        active_colors = sum(1 for it in items if it["lines"] > 0 or it["pending"])
+        total_lines = sum(it["lines"] for it in items)
+        total_m = sum(it["length_m"] for it in items)
+        total_res_m = total_m * 1.15
+        total_spools = sum(it["spools_500"] for it in items)
+        total_skeins = sum(it["skeins_8"] for it in items)
+
+        top_row = tk.Frame(self._palette_summary_frame, bg="#ffffff")
+        top_row.pack(fill=tk.X, padx=8, pady=(6, 2))
+
+        title_col = tk.Frame(top_row, bg="#ffffff")
+        title_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(
+            title_col,
+            text=self._t("pal_summary_header", mode=mode_disp),
+            font=("Segoe UI", 10, "bold"),
+            bg="#ffffff",
+            fg="#1f2328",
+            anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            title_col,
+            text=self._t("pal_summary_meta", shape=shape_disp, pins=pins, dia=dia),
+            font=("Segoe UI", 8),
+            bg="#ffffff",
+            fg="#57606a",
+            anchor="w",
+        ).pack(anchor="w")
+
+        btn_col = tk.Frame(top_row, bg="#ffffff")
+        btn_col.pack(side=tk.RIGHT, padx=(6, 0))
+        if len(self.state.layers) > 1:
+            ttk.Button(
+                btn_col,
+                text=self._t("pal_btn_show_all"),
+                command=lambda: self._select_all_layers(switch_to_canvas=True),
+            ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(
+            btn_col,
+            text=self._t("pal_btn_copy"),
+            command=self._copy_palette_spec,
+        ).pack(side=tk.LEFT)
+
+        kpi_row = tk.Frame(self._palette_summary_frame, bg="#ffffff")
+        kpi_row.pack(fill=tk.X, padx=8, pady=(2, 2))
+        for kpi_text, kpi_fg in [
+            (self._t("pal_kpi_colors", active=active_colors, total=len(items)), "#1f2328"),
+            (self._t("pal_kpi_threads", threads=total_lines), "#0969da"),
+            (self._t("pal_kpi_length", m=total_m, m_res=total_res_m), "#0f5132"),
+            (self._t("pal_kpi_spools", spools=total_spools, skeins=total_skeins), "#57606a"),
+        ]:
+            tk.Label(
+                kpi_row,
+                text=kpi_text,
+                font=("Segoe UI", 8, "bold"),
+                bg="#f6f8fa",
+                fg=kpi_fg,
+                relief="solid",
+                bd=1,
+                padx=6,
+                pady=2,
+            ).pack(side=tk.LEFT, padx=(0, 5), pady=1)
+
+        note_row = tk.Frame(self._palette_summary_frame, bg="#ffffff")
+        note_row.pack(fill=tk.X, padx=8, pady=(1, 6))
+        tk.Label(
+            note_row,
+            text=self._t("pal_order_note"),
+            font=("Segoe UI", 8),
+            bg="#ffffff",
+            fg="#57606a",
+            anchor="w",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        fb = tk.Label(note_row, text="", font=("Segoe UI", 8, "bold"), bg="#ffffff", fg="#0969da")
+        fb.pack(side=tk.RIGHT)
+        self._palette_feedback_label = fb
+
+        for it in items:
+            is_act = bool(it["is_active"])
+            card_bg = "#f0f6ff" if is_act else "#ffffff"
+            border_col = "#0969da" if is_act else "#d0d7de"
+            card = tk.Frame(
+                self._palette_cards_frame,
+                bg=card_bg,
+                highlightbackground=border_col,
+                highlightthickness=2 if is_act else 1,
+            )
+            card.pack(fill=tk.X, padx=2, pady=3)
+
+            r, g, b = it["rgb"]
+            lum = 0.299 * r + 0.587 * g + 0.114 * b
+            swatch_fg = "#111111" if lum > 145 else "#ffffff"
+            swatch = tk.Frame(card, bg=it["hex"], width=90, height=78, highlightbackground="#8c959f", highlightthickness=1)
+            swatch.pack(side=tk.LEFT, padx=8, pady=8)
+            swatch.pack_propagate(False)
+            tk.Label(
+                swatch,
+                text=self._t("pal_layer_badge", idx=it["idx"] + 1),
+                font=("Segoe UI", 8, "bold"),
+                bg=it["hex"],
+                fg=swatch_fg,
+            ).pack(pady=(14, 2))
+            tk.Label(
+                swatch,
+                text=it["hex"],
+                font=("Consolas", 9, "bold"),
+                bg=it["hex"],
+                fg=swatch_fg,
+            ).pack()
+
+            info = tk.Frame(card, bg=card_bg)
+            info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(2, 6), pady=6)
+
+            hdr = tk.Frame(info, bg=card_bg)
+            hdr.pack(fill=tk.X)
+            title_txt = f"{it['idx'] + 1}. {it['name']}"
+            if it["name_alt"]:
+                title_txt += f"  ({it['name_alt']})"
+            tk.Label(
+                hdr,
+                text=title_txt,
+                font=("Segoe UI", 9, "bold"),
+                bg=card_bg,
+                fg="#1f2328",
+                anchor="w",
+            ).pack(side=tk.LEFT)
+            if is_act:
+                tk.Label(
+                    hdr,
+                    text=self._t("pal_active_badge"),
+                    font=("Segoe UI", 7, "bold"),
+                    bg="#0969da",
+                    fg="#ffffff",
+                    padx=5,
+                    pady=1,
+                ).pack(side=tk.RIGHT, padx=(4, 0))
+            if it["group"]:
+                tk.Label(
+                    hdr,
+                    text=self._t("pal_group_label", group=it["group"]),
+                    font=("Segoe UI", 8),
+                    bg="#eaeef2",
+                    fg="#24292f",
+                    padx=5,
+                    pady=1,
+                ).pack(side=tk.RIGHT, padx=(4, 0))
+
+            c_val, m_val, y_val, k_val = it["cmyk"]
+            tk.Label(
+                info,
+                text=self._t(
+                    "pal_codes_fmt",
+                    hex=it["hex"], r=r, g=g, b=b, c=c_val, m=m_val, y=y_val, k=k_val, l=it["lightness"],
+                ),
+                font=("Consolas", 8),
+                bg=card_bg,
+                fg="#57606a",
+                anchor="w",
+            ).pack(fill=tk.X, pady=(2, 1))
+
+            if it["catalog_match"]:
+                tk.Label(
+                    info,
+                    text=self._t("pal_catalog_match", name=it["catalog_match"], de=it["delta_e"]),
+                    font=("Segoe UI", 8),
+                    bg=card_bg,
+                    fg="#57606a",
+                    anchor="w",
+                ).pack(fill=tk.X)
+
+            stat_row = tk.Frame(info, bg=card_bg)
+            stat_row.pack(fill=tk.X, pady=(3, 1))
+            if it["pending"]:
+                thr_txt = self._t("pal_threads_pending")
+                thr_fg = "#9a6700"
+            elif it["lines"] == 0:
+                thr_txt = self._t("pal_threads_zero")
+                thr_fg = "#8c959f"
+            else:
+                thr_txt = self._t("pal_threads_fmt", lines=it["lines"], share=it["share_pct"])
+                thr_fg = "#0969da"
+            tk.Label(
+                stat_row,
+                text=thr_txt,
+                font=("Segoe UI", 8, "bold"),
+                bg=card_bg,
+                fg=thr_fg,
+                anchor="w",
+            ).pack(side=tk.LEFT)
+
+            if it["lines"] > 0:
+                mini_bar = tk.Canvas(
+                    stat_row, width=130, height=8, bg="#eaeef2", highlightthickness=1, highlightbackground="#d0d7de"
+                )
+                mini_bar.pack(side=tk.LEFT, padx=(10, 0))
+                fill_w = max(3, int(round(130.0 * min(100.0, it["share_pct"]) / 100.0)))
+                mini_bar.create_rectangle(0, 0, fill_w, 8, fill=it["hex"], outline="")
+
+                tk.Label(
+                    info,
+                    text=self._t(
+                        "pal_length_fmt",
+                        m=it["length_m"], m_res=it["length_res_m"], avg_cm=it["avg_chord_cm"],
+                    ),
+                    font=("Segoe UI", 8),
+                    bg=card_bg,
+                    fg="#1f2328",
+                    anchor="w",
+                ).pack(fill=tk.X)
+                tk.Label(
+                    info,
+                    text=self._t(
+                        "pal_spools_fmt",
+                        spools=it["spools_500"], spool_pct=it["spool_pct"], skeins=it["skeins_8"],
+                    ),
+                    font=("Segoe UI", 8),
+                    bg=card_bg,
+                    fg="#1f2328",
+                    anchor="w",
+                ).pack(fill=tk.X)
+                tk.Label(
+                    info,
+                    text=self._t(
+                        "pal_pins_fmt",
+                        p_start=it["p_start"],
+                        p_end=it["p_end"],
+                        uniq=it["uniq_pins"],
+                        total_pins=it["total_pins"],
+                    ),
+                    font=("Segoe UI", 8),
+                    bg=card_bg,
+                    fg="#57606a",
+                    anchor="w",
+                ).pack(fill=tk.X)
+
+            actions = tk.Frame(card, bg=card_bg)
+            actions.pack(side=tk.RIGHT, padx=8, pady=6)
+            if it["has_layer"]:
+                ttk.Button(
+                    actions,
+                    text=self._t("pal_btn_canvas"),
+                    width=11,
+                    command=lambda i=it["idx"]: self._select_layer_by_index(i, switch_to_canvas=True),
+                ).pack(fill=tk.X, pady=(0, 2))
+                ttk.Button(
+                    actions,
+                    text=self._t("pal_btn_select"),
+                    width=11,
+                    command=lambda i=it["idx"]: self._select_layer_by_index(i, switch_to_canvas=False),
+                ).pack(fill=tk.X, pady=(0, 2))
+            ttk.Button(
+                actions,
+                text=self._t("pal_btn_copy_hex"),
+                width=11,
+                command=lambda hx=it["hex"], nm=it["name"]: self._copy_single_hex(hx, nm),
+            ).pack(fill=tk.X)
+
+            if it["has_layer"]:
+                for click_w in (card, swatch, info, hdr):
+                    click_w.bind("<Button-1>", lambda _e, i=it["idx"]: self._select_layer_by_index(i, False))
+                    click_w.bind("<Double-Button-1>", lambda _e, i=it["idx"]: self._select_layer_by_index(i, True))
+
+        if self._palette_canvas:
+            self._palette_cards_frame.update_idletasks()
+            self._palette_canvas.configure(scrollregion=self._palette_canvas.bbox("all"))
 
     def update_palette(self, colors: List[Dict[str, Any]]) -> None:
-        """Отображает визуальные цветные чипы выбранных нитей с названием и HEX-кодом."""
+        """Сохраняет палитру адаптивного режима и обновляет отдельную вкладку палитры нитей."""
         self._last_palette_colors = list(colors) if colors else []
-        if not hasattr(self, "_palette_frame"):
-            return
-        for child in self._palette_frame.winfo_children():
-            child.destroy()
-        if not colors:
-            return
-        lbl = ttk.Label(self._palette_frame, text=self._t("palette_title"), font=("Segoe UI", 8, "bold"))
-        lbl.pack(anchor="w", pady=(2, 1))
-        flow = ttk.Frame(self._palette_frame)
-        flow.pack(fill=tk.X, expand=True)
-        is_en = normalize_lang(self.state.lang) == "en"
-        for i, c in enumerate(colors):
-            hex_c = c.get("hex", "#333333")
-            raw_name = c.get("name", f"Color {i+1}" if is_en else f"Цвет {i+1}")
-            name = c.get("name_en") if (is_en and c.get("name_en")) else translate_layer_name(raw_name, self.state.lang)
-            rgb = c.get("rgb", [50, 50, 50])
-            lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
-            fg = "#111111" if lum > 145 else "#ffffff"
-            chip = tk.Label(
-                flow,
-                text=f" {i+1}. {name} {hex_c} ",
-                bg=hex_c,
-                fg=fg,
-                font=("Segoe UI", 8, "bold"),
-                relief="ridge",
-                bd=1,
-                padx=3,
-                pady=1,
-                cursor="hand2",
-            )
-            chip.pack(side=tk.LEFT, padx=1, pady=1)
-            chip.bind("<Button-1>", lambda _e, idx=i: self._select_layer_by_index(idx))
+        self.refresh_palette_tab()
 
-    def _select_layer_by_index(self, idx: int) -> None:
+    def _select_all_layers(self, switch_to_canvas: bool = True) -> None:
+        cb = self.widgets.get("active_layer_combo")
+        if isinstance(cb, ttk.Combobox) and len(self.state.layers) > 1:
+            cb.current(0)
+            self._on_active_layer_changed()
+            if switch_to_canvas:
+                nb = self.widgets.get("results_notebook")
+                if isinstance(nb, ttk.Notebook) and nb.tabs():
+                    nb.select(0)
+
+    def _select_layer_by_index(self, idx: int, switch_to_canvas: bool = False) -> None:
         cb = self.widgets.get("active_layer_combo")
         if isinstance(cb, ttk.Combobox) and 0 <= idx < len(self.state.layers):
             target_cb_idx = idx + 1 if len(self.state.layers) > 1 else idx
             if target_cb_idx < len(cb["values"]):
                 cb.current(target_cb_idx)
                 self._on_active_layer_changed()
+                if switch_to_canvas:
+                    nb = self.widgets.get("results_notebook")
+                    if isinstance(nb, ttk.Notebook) and nb.tabs():
+                        nb.select(0)
 
     def _on_active_layer_changed(self, _event=None) -> None:
         if not self.state.layers:
@@ -1064,6 +1685,7 @@ class UIManager:
                     scale.configure(to=max(1, total_all))
                 self.state.vars["step_scrubber"].set(max(1, total_all))
                 self.update_player_step_label()
+                self.refresh_palette_tab()
                 self._on_visual_param_change()
                 return
             elif cur_idx > 0:
@@ -1083,6 +1705,7 @@ class UIManager:
                 scale.configure(to=max(1, max_steps))
             self.state.vars["step_scrubber"].set(max_steps)
             self.update_player_step_label()
+            self.refresh_palette_tab()
             self._on_visual_param_change()
 
     def _on_scrubber_slider_move(self, *_args) -> None:
@@ -1144,16 +1767,25 @@ class UIManager:
     def setup_notebook_tabs(self, num_islands: int) -> None:
         notebook = self.widgets["results_notebook"]
         for tab_id in notebook.tabs():
+            tab_w = notebook.nametowidget(tab_id)
             notebook.forget(tab_id)
+            tab_w.destroy()
         self.result_canvases.clear()
         self.result_photo_refs.clear()
+        self._palette_cards_frame = None
+        self._palette_canvas = None
+        self._palette_summary_frame = None
+        self._palette_bar_canvas = None
+        self._palette_feedback_label = None
 
         self._create_notebook_tab("overall", self._t("tab_overall"), notebook)
-
+        self._create_palette_tab(notebook)
         self._create_analysis_canvas_tab(notebook, "diff_map", self._t("tab_diff_map"))
         self._create_analysis_canvas_tab(notebook, "density_heatmap", self._t("tab_density"))
         self._create_analysis_canvas_tab(notebook, "fit_saliency", self._t("tab_saliency"))
         self._create_analysis_canvas_tab(notebook, "radon_sinogram", self._t("tab_radon"))
+        self._results_tab_keys = ["overall", "palette", "diff_map", "density_heatmap", "fit_saliency", "radon_sinogram"]
+        self.refresh_palette_tab()
 
     def _create_analysis_canvas_tab(self, parent_notebook: ttk.Notebook, key: str, title: str) -> None:
         frame = ttk.Frame(parent_notebook)

@@ -78,6 +78,30 @@ LAYER_NAME_EN: Dict[str, str] = {
 }
 _LAYER_NAME_RU: Dict[str, str] = {v: k for k, v in LAYER_NAME_EN.items()}
 
+COLOR_GROUP_EN: Dict[str, str] = {
+    "Белые": "Whites",
+    "Бирюзовые": "Turquoise / Cyan",
+    "Жёлтые": "Yellows",
+    "Зелёные": "Greens",
+    "Коричневые": "Browns",
+    "Красные": "Reds",
+    "Оранжевые": "Oranges",
+    "Пурпурные": "Magentas / Purples",
+    "Розовые": "Pinks",
+    "Серые": "Grays",
+    "Синие": "Blues",
+    "Фиолетовые": "Violets",
+    "Чёрные": "Blacks",
+}
+
+
+def translate_color_group(group: str, lang: str) -> str:
+    if not group:
+        return ""
+    if normalize_lang(lang) == "en":
+        return COLOR_GROUP_EN.get(group, group)
+    return group
+
 
 def normalize_lang(lang: Optional[str]) -> str:
     if not lang:
@@ -402,11 +426,40 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "st_adaptive_selecting": "Адаптивный подбор: выбор {n} цветов из каталога ({total} вариантов)...",
         "st_adaptive_layer": "Адаптивный слой {idx}/{n} ({name})...",
         "st_adaptive_done": "Адаптивный подбор завершен ({n} цветов)!",
+        "st_adaptive_done_partial": "Адаптивный подбор завершен: {n} из {req} цветов (лишние/схожие оттенки объединены)",
         "all_colors_option": "🌈 Все цвета ({total} {unit})",
         "all_colors_step": "Все цвета: шаг {step}/{total}",
         "palette_title": "Палитра нитей:",
         "st_done_adaptive_fmt": "{msg} ({per_layer} | Всего: {total})",
         "kb_shortcuts_hint": "⌨ Пробел / D / → = Следующий шаг\n⌨ A / ← = Предыдущий шаг\n⌨ Панель управления плеером расположена под холстом ↓",
+        "tab_palette": "🎨 Палитра нитей",
+        "pal_empty_title": "Палитра нитей пока не сформирована",
+        "pal_empty_hint": "Загрузите изображение и запустите синтез (или откройте проект .sart.json), чтобы увидеть подробную спецификацию цветов, расход нити и порядок плетения.",
+        "pal_summary_header": "Спецификация нитей • {mode}",
+        "pal_summary_meta": "Холст: {shape} • {pins} гвоздей • Размер: {dia:.1f} см",
+        "pal_kpi_colors": "Цветов (акт./всего): {active}/{total}",
+        "pal_kpi_threads": "Всего нитей: {threads}",
+        "pal_kpi_length": "Расход: {m:.1f} м (+15% запас: {m_res:.1f} м)",
+        "pal_kpi_spools": "Катушки 500 м: {spools} шт. • Мулине 8 м: ~{skeins} мот.",
+        "pal_btn_show_all": "🌈 Все цвета на холсте",
+        "pal_btn_copy": "📋 Копировать спецификацию",
+        "pal_copied_msg": "Спецификация палитры скопирована в буфер обмена.",
+        "pal_order_note": "Порядок плетения: сверху вниз (от базового слоя к верхнему). Клик по карточке выбирает слой; двойной клик открывает слой на холсте.",
+        "pal_layer_badge": "Слой #{idx}",
+        "pal_active_badge": "● АКТИВЕН",
+        "pal_group_label": "Группа: {group}",
+        "pal_catalog_match": "Ближайший в каталоге: {name} (ΔE {de:.1f})",
+        "pal_codes_fmt": "HEX: {hex}  •  RGB: ({r}, {g}, {b})  •  CMYK: {c}/{m}/{y}/{k}%  •  Светлота L*: {l:.0f}%",
+        "pal_threads_fmt": "Нитей: {lines} ({share:.1f}%)",
+        "pal_threads_zero": "0 нитей — цвет не требуется",
+        "pal_threads_pending": "Ожидает синтеза...",
+        "pal_length_fmt": "Длина: {m:.1f} м (запас +15%: {m_res:.1f} м)  •  Ср. хорда: {avg_cm:.1f} см",
+        "pal_spools_fmt": "Катушки 500 м: {spools} шт. ({spool_pct:.0f}%)  •  Мулине 8 м: ~{skeins} мот.",
+        "pal_pins_fmt": "Маршрут: гвоздь {p_start} → {p_end}  •  Задействовано гвоздей: {uniq}/{total_pins}",
+        "pal_btn_select": "👁 Выбрать",
+        "pal_btn_canvas": "🔍 На холст",
+        "pal_btn_copy_hex": "# HEX",
+        "pal_hex_copied": "Скопировано: {hex} — {name}",
     },
     "en": {
         "dashboard_frame": "Evolution Dashboard & Algorithm Analytics",
@@ -568,11 +621,40 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "st_adaptive_selecting": "Adaptive matching: selecting {n} colors from catalog ({total} variants)...",
         "st_adaptive_layer": "Adaptive layer {idx}/{n} ({name})...",
         "st_adaptive_done": "Adaptive color matching done ({n} colors)!",
+        "st_adaptive_done_partial": "Adaptive matching done: {n} of {req} colors (redundant/similar shades merged)",
         "all_colors_option": "🌈 All Colors ({total} {unit})",
         "all_colors_step": "All colors: step {step}/{total}",
         "palette_title": "Thread Palette:",
         "st_done_adaptive_fmt": "{msg} ({per_layer} | Total: {total})",
         "kb_shortcuts_hint": "⌨ Space / D / → = Next step\n⌨ A / ← = Prev step\n⌨ Player controls are in the bar below ↓",
+        "tab_palette": "🎨 Thread Palette",
+        "pal_empty_title": "Thread palette is not generated yet",
+        "pal_empty_hint": "Load an image and start synthesis (or open a .sart.json project) to view detailed thread colors, meterage, and weaving order.",
+        "pal_summary_header": "Thread Specification • {mode}",
+        "pal_summary_meta": "Canvas: {shape} • {pins} pins • Size: {dia:.1f} cm",
+        "pal_kpi_colors": "Colors (active/total): {active}/{total}",
+        "pal_kpi_threads": "Total threads: {threads}",
+        "pal_kpi_length": "Length: {m:.1f} m (+15% reserve: {m_res:.1f} m)",
+        "pal_kpi_spools": "500 m spools: {spools} • 8 m skeins: ~{skeins}",
+        "pal_btn_show_all": "🌈 Show All on Canvas",
+        "pal_btn_copy": "📋 Copy Specification",
+        "pal_copied_msg": "Thread palette specification copied to clipboard.",
+        "pal_order_note": "Weaving order: top to bottom (base layer to top accent). Click a card to select the layer; double-click to view it on the canvas.",
+        "pal_layer_badge": "Layer #{idx}",
+        "pal_active_badge": "● ACTIVE",
+        "pal_group_label": "Group: {group}",
+        "pal_catalog_match": "Closest catalog shade: {name} (ΔE {de:.1f})",
+        "pal_codes_fmt": "HEX: {hex}  •  RGB: ({r}, {g}, {b})  •  CMYK: {c}/{m}/{y}/{k}%  •  Lightness L*: {l:.0f}%",
+        "pal_threads_fmt": "Threads: {lines} ({share:.1f}%)",
+        "pal_threads_zero": "0 threads — color not required",
+        "pal_threads_pending": "Pending synthesis...",
+        "pal_length_fmt": "Length: {m:.1f} m (+15% reserve: {m_res:.1f} m)  •  Avg chord: {avg_cm:.1f} cm",
+        "pal_spools_fmt": "500 m spools: {spools} ({spool_pct:.0f}%)  •  8 m skeins: ~{skeins}",
+        "pal_pins_fmt": "Route: pin {p_start} → {p_end}  •  Pins used: {uniq}/{total_pins}",
+        "pal_btn_select": "👁 Select",
+        "pal_btn_canvas": "🔍 Canvas",
+        "pal_btn_copy_hex": "# HEX",
+        "pal_hex_copied": "Copied: {hex} — {name}",
     },
 }
 
@@ -586,7 +668,7 @@ TOOLTIPS_EN: Dict[str, str] = {
     "gamma": "Gamma correction (< 1.0 lightens midtones and prevents muddy over-darkening).",
     "canvas_shape": "Frame geometry for pin placement (Circle, Square, Rectangle, Oval, Hexagon).",
     "color_mode": "Weaving mode: Monochrome (black/white thread), 4-layer CMYK, or Adaptive color matching (N colors from catalog).",
-    "adaptive_n_colors": "Number of thread colors (2 to 20) automatically selected from the 1017-color catalog to match the image.",
+    "adaptive_n_colors": "Maximum number of thread colors (2 to 20) selected from the 1017-color catalog. Perceptually distinct shades (CIEDE2000) are chosen; absent, near-duplicate, or negligible layers are omitted automatically.",
     "physical_diameter": "Physical board size/diameter (cm) for accurate thread meterage and CNC G-Code.",
     "pins": "Number of perimeter pins.\nRecommended: 240–320.",
     "lines": "Maximum threads per layer.\nAutomatically reduces excess threads (down to 0 for absent colors) and adds up to max.",

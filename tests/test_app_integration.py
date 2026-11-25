@@ -39,9 +39,11 @@ class TestAppIntegration(unittest.TestCase):
             app.state.vars["pins"].set("")
             self.assertIsNotNone(app.state.get_config()["pins"])
 
-            # Проверка, что вкладки островов удалены и осталось ровно 5 вкладок результатов
+            # Проверка 6 вкладок результатов (включая отдельную вкладку Палитры нитей) и 5 графических холстов
             nb = app.ui_manager.widgets["results_notebook"]
-            self.assertEqual(len(nb.tabs()), 5)
+            self.assertEqual(len(nb.tabs()), 6)
+            self.assertIn("palette", app.ui_manager._results_tab_keys)
+            self.assertIn("palette_tab_frame", app.ui_manager.widgets)
             self.assertEqual(list(app.ui_manager.result_canvases.keys()), ["overall", "diff_map", "density_heatmap", "fit_saliency", "radon_sinogram"])
 
             # Проверка переключения режима Адаптивный подбор (N цветов) и видимости спинбокса
@@ -55,7 +57,6 @@ class TestAppIntegration(unittest.TestCase):
             test_white_bg[20:50, 20:80] = [180, 20, 30]   # Темно-красный
             test_white_bg[50:80, 20:80] = [20, 30, 140]   # Темно-синий
             chosen_white_bg = app.coordinator._select_adaptive_colors(test_white_bg, n=3, invert_board=False)
-            chosen = chosen_white_bg
             names_wb = [c["name"] for c in chosen_white_bg]
             self.assertNotIn("Белый", names_wb)
             self.assertNotIn("Абрикосовый", names_wb)
@@ -187,10 +188,27 @@ class TestAppIntegration(unittest.TestCase):
             active_channels = sum(1 for d_m in dens_multi if int(np.sum(d_m > 0.12)) >= 40)
             self.assertEqual(active_channels, 6, "Все 6 подобранных цветов должны получить информативную плотность")
 
-            # Проверка отображения чипов палитры в UI
-            app.ui_manager.update_palette(chosen)
+            # Запрос N=12 на 6-цветной картинке не должен плодить фантомные цвета и близкие дубли (CIEDE2000 >= 10)
+            sel_over = app.coordinator._select_adaptive_colors(multi_img, n=12, invert_board=False)
+            self.assertLessEqual(len(sel_over), 8)
+            self.assertGreaterEqual(len(sel_over), 5)
+            over_rgb = np.array([[c["rgb"][0], c["rgb"][1], c["rgb"][2]] for c in sel_over], dtype=np.float32) / 255.0
+            over_lab = app.coordinator._rgb_to_lab(over_rgb)
+            for idx_a in range(len(over_lab)):
+                for idx_b in range(idx_a + 1, len(over_lab)):
+                    de00 = float(app.coordinator._ciede2000_vec(over_lab[idx_a], over_lab[idx_b : idx_b + 1])[0])
+                    self.assertGreaterEqual(de00, 10.0)
+
+            # Проверка подробной вкладки «Палитра нитей» (включая 0-слой Cyan, метры и катушки)
+            app.ui_manager.refresh_palette_tab()
             app.update()
-            self.assertGreater(len(app.ui_manager._palette_frame.winfo_children()), 0)
+            self.assertEqual(len(app.ui_manager._palette_cards_frame.winfo_children()), 4)
+            cmyk_spec = app.ui_manager._build_palette_text_spec()
+            self.assertIn("HEX:", cmyk_spec)
+            self.assertIn("RGB:", cmyk_spec)
+            self.assertIn("CMYK:", cmyk_spec)
+            self.assertIn("0 нитей", cmyk_spec)
+            self.assertIn("Катушки 500 м", cmyk_spec)
 
             # Тест экспорта HTML, TXT и сохранения/загрузки проекта (.sart.json) с пустым слоем Cyan
             with tempfile.TemporaryDirectory() as tmp:
@@ -252,6 +270,8 @@ class TestAppIntegration(unittest.TestCase):
                 time.sleep(0.03)
             self.assertFalse(app.state.is_running, "Адаптивный синтез не завершился вовремя")
             self.assertGreaterEqual(len(app.state.layers), 2)
+            for lyr in app.state.layers:
+                self.assertGreaterEqual(len(lyr.get("path", [])) - 1, 5, "Адаптивный слой не должен состоять из 1 нити")
             adapt_names_before = [l["name"] for l in app.state.layers]
             for nm in adapt_names_before:
                 self.assertNotEqual(nm, "Черная нить")
@@ -272,18 +292,26 @@ class TestAppIntegration(unittest.TestCase):
             for nm in [l["name"] for l in app.state.layers]:
                 self.assertNotEqual(nm, "Черная нить")
 
-            # Тест живого переключения языка RU -> EN -> RU без перезапуска (включая чипы палитры)
+            # Тест живого переключения языка RU -> EN -> RU без перезапуска (включая вкладку Палитры нитей)
             app.set_language("en", persist=False)
             app.update()
             self.assertEqual(app.state.lang, "en")
             self.assertEqual(app.ui_manager.widgets["start_button"].cget("text"), "▶ Start (CSR OMP + Islands)")
             self.assertEqual(app.state.vars["color_mode"].get(), "Adaptive Color Matching (N colors)")
             self.assertEqual(app.state.vars["canvas_shape"].get(), "Circle")
-            pal_children = app.ui_manager._palette_frame.winfo_children()
-            self.assertGreaterEqual(len(pal_children), 2)
-            chip_texts = [w.cget("text") for w in pal_children[1].winfo_children()]
-            self.assertTrue(chip_texts)
-            self.assertTrue(all(not any("\u0400" <= ch <= "\u04ff" for ch in txt) for txt in chip_texts))
+            nb = app.ui_manager.widgets["results_notebook"]
+            self.assertEqual(nb.tab(nb.tabs()[1], "text"), "🎨 Thread Palette")
+            cards = app.ui_manager._palette_cards_frame.winfo_children()
+            self.assertEqual(len(cards), len(app.state.layers))
+            en_spec = app.ui_manager._build_palette_text_spec()
+            self.assertTrue(en_spec)
+            self.assertFalse(any("\u0400" <= ch <= "\u04ff" for ch in en_spec))
+            nb.select(1)
+            app.update()
+            app.ui_manager._select_layer_by_index(0, switch_to_canvas=True)
+            app.update()
+            self.assertEqual(app.state.active_layer_idx, 0)
+            self.assertEqual(nb.index(nb.select()), 0)
             cfg_en = app.state.get_config()
             self.assertEqual(cfg_en["language"], "en")
             self.assertEqual(cfg_en["color_mode"], "Адаптивный подбор (N цветов)")
@@ -294,6 +322,8 @@ class TestAppIntegration(unittest.TestCase):
             self.assertEqual(app.state.lang, "ru")
             self.assertEqual(app.ui_manager.widgets["start_button"].cget("text"), "▶ Старт (CSR OMP + Острова)")
             self.assertEqual(app.state.vars["color_mode"].get(), "Адаптивный подбор (N цветов)")
+            self.assertEqual(nb.tab(nb.tabs()[1], "text"), "🎨 Палитра нитей")
+            self.assertIn("Спецификация нитей", app.ui_manager._build_palette_text_spec())
         finally:
             app.coordinator.shutdown()
             app.audio_assistant.shutdown()

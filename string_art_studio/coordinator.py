@@ -376,7 +376,7 @@ class EvolutionCoordinator:
             for d_map in channel_densities
         ]
         total_phys = sum(phys_budgets)
-        budget_cap = int(round(max_lines * 1.60))
+        budget_cap = int(round(max_lines * min(2.40, 1.40 + 0.08 * len(channel_densities))))
         if total_phys > budget_cap and total_phys > 0:
             scale_b = budget_cap / float(total_phys)
             ch_budgets = [
@@ -386,6 +386,35 @@ class EvolutionCoordinator:
         else:
             ch_budgets = list(phys_budgets)
         return phys_budgets, ch_budgets
+
+    @staticmethod
+    def _compute_total_activity(rgb_norm: np.ndarray, invert_board: bool) -> np.ndarray:
+        gray_norm = 0.299 * rgb_norm[:, :, 0] + 0.587 * rgb_norm[:, :, 1] + 0.114 * rgb_norm[:, :, 2]
+        if not invert_board:
+            chroma_strength = 1.0 - np.min(rgb_norm, axis=-1)
+            return np.maximum(1.0 - gray_norm, 0.85 * chroma_strength)
+        chroma_strength = np.max(rgb_norm, axis=-1)
+        return np.maximum(gray_norm, 0.85 * chroma_strength)
+
+    @staticmethod
+    def _compute_adaptive_importance(
+        ch_density: np.ndarray,
+        total_activity: np.ndarray,
+        mask: np.ndarray,
+        num_colors: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Снижает штраф пересечения чужих цветных зон предмета (сохраняя 100% защиту чистого фона)."""
+        edg, imp = _compute_channel_edges_and_importance(ch_density, mask, boost=1.1)
+        if num_colors >= 3:
+            m_ok = mask.reshape(ch_density.shape) == 255
+            act_2d = total_activity.reshape(ch_density.shape)
+            other_color_px = m_ok & (ch_density <= 0.06) & (act_2d > 0.15)
+            imp = np.where(other_color_px, imp * 0.55, imp)
+            mask_area = max(1, int(np.sum(m_ok)))
+            patch_px = m_ok & (ch_density > 0.06)
+            if 0 < int(np.sum(patch_px)) < int(mask_area * 0.05):
+                imp = np.where(patch_px, imp * 1.15, imp)
+        return edg, imp.astype(np.float32, copy=False)
 
     def _build_channels_for_existing_layers(
         self, bundle: Dict[str, Any], config: Dict[str, Any]
@@ -407,10 +436,11 @@ class EvolutionCoordinator:
         ]
         rgb_smooth = self._preprocess_rgb_for_adaptive(bundle["rgb"], config, invert_board)
         rgb_norm = np.clip(rgb_smooth.astype(np.float32) / 255.0, 0.0, 1.0)
+        total_activity = self._compute_total_activity(rgb_norm, invert_board)
         densities = self._decompose_adaptive_channels(rgb_norm, palette, mask, invert_board=invert_board)
         res: List[Dict[str, Any]] = []
         for l, d_map in zip(self.state.layers, densities):
-            edg, imp = _compute_channel_edges_and_importance(d_map, mask, boost=1.1)
+            edg, imp = self._compute_adaptive_importance(d_map, total_activity, mask, len(palette))
             res.append({
                 "name": str(l.get("name", "Слой")),
                 "color_hex": str(l.get("color_hex", "#111111")),
@@ -941,23 +971,40 @@ class EvolutionCoordinator:
                 # Предобработка исходного изображения под цветоделение (сглаживание шума и гамма)
                 rgb_smooth = self._preprocess_rgb_for_adaptive(rgb_img, config, invert_board)
                 rgb_norm = np.clip(rgb_smooth.astype(np.float32) / 255.0, 0.0, 1.0)
+                total_activity = self._compute_total_activity(rgb_norm, invert_board)
 
-                # 1) Подбор N информативных цветов из каталога с гарантированным покрытием областей изображения
+                # 1) Подбор до N перцептивно различимых (CIEDE2000) цветов из каталога
                 selected_colors = self._select_adaptive_colors(rgb_smooth, n_colors, mask=mask, invert_board=invert_board)
-                self.queues["status_queue"].put({"type": "palette_update", "run_id": run_id, "data": selected_colors})
 
                 # 2) Физическое трехканальное цветоделение Бера-Ламберта (согласованное с render_layers_to_numpy)
                 channel_densities = self._decompose_adaptive_channels(rgb_norm, selected_colors, mask, invert_board=invert_board)
 
-                # 3) Оценка физической потребности каждого слоя (с учетом запаса 1.8x внутри estimate_channel_line_budget,
-                #    так как OMP авто-стоп и дельта-прунинг оставляют ~55-65% от верхнего лимита ch_budget)
+                # 2.5) Предсинтезная консолидация: отсеиваем слабые/малочисленные цвета и перераспределяем их пиксели
+                mask_area = max(1, int(np.sum(mask == 255)))
+                min_px_area = max(80, int(mask_area * 0.002))
+                strong_idx = [
+                    i
+                    for i, d_map in enumerate(channel_densities)
+                    if int(np.sum(d_map > 0.06)) >= min_px_area
+                    and estimate_channel_line_budget(d_map, mask, cm, max_lines, line_weight) >= 12
+                ]
+                if 0 < len(strong_idx) < len(selected_colors):
+                    selected_colors = [selected_colors[i] for i in strong_idx]
+                    channel_densities = self._decompose_adaptive_channels(
+                        rgb_norm, selected_colors, mask, invert_board=invert_board
+                    )
+
+                self.queues["status_queue"].put({"type": "palette_update", "run_id": run_id, "data": selected_colors})
+
+                # 3) Оценка физической потребности каждого слоя
                 phys_budgets, ch_budgets = self._compute_adaptive_budgets(
                     channel_densities, mask, cm, max_lines, line_weight
                 )
+                min_layer_threads = max(5, min(15, max_lines // 40))
 
                 logging.info(
-                    "Адаптивный режим (%d цв.): физ. потребность=%s, бюджеты=%s (сумма=%d при лимите=%d)",
-                    len(selected_colors), phys_budgets, ch_budgets, sum(ch_budgets), max_lines,
+                    "Адаптивный режим (%d/%d цв.): физ. потребность=%s, бюджеты=%s (сумма=%d при лимите=%d)",
+                    len(selected_colors), n_colors, phys_budgets, ch_budgets, sum(ch_budgets), max_lines,
                 )
 
                 for c_idx, sc in enumerate(selected_colors):
@@ -974,7 +1021,9 @@ class EvolutionCoordinator:
                         logging.info(f"Слой '{disp_name}' не требует нитей (бюджет {ch_budget}) — пропуск.")
                         continue
 
-                    adapt_edges, adapt_imp = _compute_channel_edges_and_importance(adapt_darkness, mask, boost=1.1)
+                    adapt_edges, adapt_imp = self._compute_adaptive_importance(
+                        adapt_darkness, total_activity, mask, len(selected_colors)
+                    )
 
                     fc = FitnessCalculator(
                         bundle["gray"], adapt_edges, bundle["saliency"], adapt_imp,
@@ -1026,14 +1075,17 @@ class EvolutionCoordinator:
                                 logging.info(f"Слой '{disp_name}': устранено {n_rem} избыточных нитей")
 
                     n_done = max(0, len(base_path) - 1)
-                    if n_done > 0:
+                    keep_fallback = len(accumulated_layers) == 0 and c_idx == len(selected_colors) - 1 and n_done >= 2
+                    if n_done >= min_layer_threads or keep_fallback:
                         accumulated_layers.append({"name": name_ru, "color_hex": hex_c, "path": base_path, "ref_lines": max_lines})
                         self.queues["status_queue"].put({
                             "type": "greedy_update", "run_id": run_id,
                             "data": {"text": tr("st_cmyk_layer_done", lang, name=disp_name, lines=n_done), "layers": list(accumulated_layers), "active_idx": len(accumulated_layers) - 1},
                         })
                     else:
-                        logging.info(f"Слой '{disp_name}' не получил нитей (0 линий) и был исключен.")
+                        logging.info(
+                            f"Слой '{disp_name}' дал слишком мало нитей ({n_done} < {min_layer_threads}) и был исключен."
+                        )
 
                 self.state.layers = list(accumulated_layers)
                 active_palette = [
@@ -1046,7 +1098,12 @@ class EvolutionCoordinator:
                 ]
                 self.queues["status_queue"].put({"type": "palette_update", "run_id": run_id, "data": active_palette})
 
-                msg = tr("st_stopped_user", lang) if self.omp_stop_flag else tr("st_adaptive_done", lang, n=len(accumulated_layers))
+                if self.omp_stop_flag:
+                    msg = tr("st_stopped_user", lang)
+                elif len(accumulated_layers) < n_colors:
+                    msg = tr("st_adaptive_done_partial", lang, n=len(accumulated_layers), req=n_colors)
+                else:
+                    msg = tr("st_adaptive_done", lang, n=len(accumulated_layers))
                 self.queues["status_queue"].put({"type": "done", "run_id": run_id, "data": msg})
 
         except Exception:
@@ -1080,6 +1137,70 @@ class EvolutionCoordinator:
         lab = np.stack([L, a, b], axis=-1)
         return lab.reshape(shape[:-1] + (3,))
 
+    @staticmethod
+    def _ciede2000_vec(lab1: np.ndarray, lab2_arr: np.ndarray) -> np.ndarray:
+        """Векторизованное перцептивное цветовое расстояние CIEDE2000 от lab1 (3,) до lab2_arr (K, 3)."""
+        L1 = float(lab1[0])
+        a1 = float(lab1[1])
+        b1 = float(lab1[2])
+        L2 = lab2_arr[:, 0].astype(np.float64, copy=False)
+        a2 = lab2_arr[:, 1].astype(np.float64, copy=False)
+        b2 = lab2_arr[:, 2].astype(np.float64, copy=False)
+
+        C1 = (a1 * a1 + b1 * b1) ** 0.5
+        C2 = np.sqrt(a2 * a2 + b2 * b2)
+        C_bar = 0.5 * (C1 + C2)
+        C_bar7 = C_bar ** 7
+        G = 0.5 * (1.0 - np.sqrt(C_bar7 / (C_bar7 + 25.0 ** 7)))
+
+        a1p = (1.0 + G) * a1
+        a2p = (1.0 + G) * a2
+        C1p = np.sqrt(a1p * a1p + b1 * b1)
+        C2p = np.sqrt(a2p * a2p + b2 * b2)
+
+        h1p = np.degrees(np.arctan2(b1, a1p)) % 360.0
+        h2p = np.degrees(np.arctan2(b2, a2p)) % 360.0
+
+        dLp = L2 - L1
+        dCp = C2p - C1p
+        c_prod = C1p * C2p
+        dhp = h2p - h1p
+        dhp = np.where(dhp > 180.0, dhp - 360.0, dhp)
+        dhp = np.where(dhp < -180.0, dhp + 360.0, dhp)
+        dhp = np.where(c_prod == 0.0, 0.0, dhp)
+        dHp = 2.0 * np.sqrt(np.maximum(0.0, c_prod)) * np.sin(np.radians(0.5 * dhp))
+
+        L_bar_p = 0.5 * (L1 + L2)
+        C_bar_p = 0.5 * (C1p + C2p)
+        h_sum = h1p + h2p
+        h_diff = np.abs(h1p - h2p)
+        h_bar_p = np.where(
+            c_prod == 0.0,
+            h_sum,
+            np.where(
+                h_diff <= 180.0,
+                0.5 * h_sum,
+                np.where(h_sum < 360.0, 0.5 * (h_sum + 360.0), 0.5 * (h_sum - 360.0)),
+            ),
+        )
+        T = (
+            1.0
+            - 0.17 * np.cos(np.radians(h_bar_p - 30.0))
+            + 0.24 * np.cos(np.radians(2.0 * h_bar_p))
+            + 0.32 * np.cos(np.radians(3.0 * h_bar_p + 6.0))
+            - 0.20 * np.cos(np.radians(4.0 * h_bar_p - 63.0))
+        )
+        d_theta = 30.0 * np.exp(-(((h_bar_p - 275.0) / 25.0) ** 2))
+        C_bar_p7 = C_bar_p ** 7
+        RC = 2.0 * np.sqrt(C_bar_p7 / (C_bar_p7 + 25.0 ** 7))
+        L50 = (L_bar_p - 50.0) ** 2
+        SL = 1.0 + (0.015 * L50) / np.sqrt(20.0 + L50)
+        SC = 1.0 + 0.045 * C_bar_p
+        SH = 1.0 + 0.015 * C_bar_p * T
+        RT = -np.sin(np.radians(2.0 * d_theta)) * RC
+        de2 = (dLp / SL) ** 2 + (dCp / SC) ** 2 + (dHp / SH) ** 2 + RT * (dCp / SC) * (dHp / SH)
+        return np.sqrt(np.maximum(0.0, de2)).astype(np.float32)
+
     def _select_adaptive_colors(
         self,
         rgb_image: np.ndarray,
@@ -1087,8 +1208,9 @@ class EvolutionCoordinator:
         mask: Optional[np.ndarray] = None,
         invert_board: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Выбирает N оптимальных контрастных цветов нитей из COLOR_CATALOG кластеризацией областей изображения в CIE Lab."""
+        """Выбирает до N перцептивно различимых (CIEDE2000) контрастных цветов нитей из COLOR_CATALOG."""
         img_f32 = rgb_image.astype(np.float32) / 255.0
+        min_de00 = max(10.5, 15.0 - 0.25 * max(0, int(n) - 4))
 
         cat_rgb = np.array([[c["rgb"][0], c["rgb"][1], c["rgb"][2]] for c in COLOR_CATALOG], dtype=np.float32) / 255.0
         cat_lab = self._rgb_to_lab(cat_rgb)  # (K, 3)
@@ -1121,18 +1243,15 @@ class EvolutionCoordinator:
         cand_lab = cat_lab[valid_indices]
         cand_colors = [COLOR_CATALOG[i] for i in valid_indices]
 
-        # Извлечение всех пигментированных пикселей и восстановление их собственного цвета нити (de-tinted Beer-Lambert ink color):
-        # На белом холсте светлый оттенок (например, голубое небо или бежевое лицо) создается насыщенной нитью при меньшей плотности d.
-        # Восстанавливаем вектор поглощения пигмента a_ink = tau / max(tau), чтобы подбирать насыщенные нити, а не бледные серые оттенки.
+        # Извлечение всех пигментированных пикселей и восстановление их собственного цвета нити (de-tinted Beer-Lambert ink color)
         gray = 0.299 * img_f32[:, :, 0] + 0.587 * img_f32[:, :, 1] + 0.114 * img_f32[:, :, 2]
         if not invert_board:
             tau_px = -np.log(np.clip(img_f32, 0.04, 1.0)) / 1.6
             tau_max = np.max(tau_px, axis=-1)
             darkness = np.clip(1.0 - np.exp(-1.6 * tau_max), 0.0, 1.0)
             a_unit = tau_px / (tau_max[:, :, np.newaxis] + 1e-4)
-            # Смешиваем собственный цвет пигмента (70%) и фактический цвет пикселя (30%), сохраняя различие между светлыми и темными тонами
-            ink_Strength = np.clip(tau_max / 0.65, 0.35, 0.95)[:, :, np.newaxis]
-            eff_rgb = np.clip(0.68 * (1.0 - a_unit * ink_Strength) + 0.32 * img_f32, 0.0, 1.0)
+            ink_strength = np.clip(tau_max / 0.65, 0.35, 0.95)[:, :, np.newaxis]
+            eff_rgb = np.clip(0.68 * (1.0 - a_unit * ink_strength) + 0.32 * img_f32, 0.0, 1.0)
         else:
             luma_light = gray
             chroma_light = np.max(img_f32, axis=-1)
@@ -1147,6 +1266,17 @@ class EvolutionCoordinator:
             pigment_mask = darkness > float(np.percentile(darkness, 40))
         if np.sum(pigment_mask) < 10:
             pigment_mask = np.ones_like(darkness, dtype=bool)
+
+        # Подавление пикселей 1-2 px переходного сглаживания на границах объектов (ореолы смешивания)
+        pigment_area = int(np.sum(pigment_mask))
+        if pigment_area >= 400:
+            gx_rgb = cv2.Sobel(img_f32, cv2.CV_32F, 1, 0, ksize=3)
+            gy_rgb = cv2.Sobel(img_f32, cv2.CV_32F, 0, 1, ksize=3)
+            grad = np.max(np.hypot(gx_rgb, gy_rgb), axis=-1)
+            grad_thresh = float(np.percentile(grad[pigment_mask], 80))
+            interior_mask = pigment_mask & (grad <= grad_thresh)
+            if int(np.sum(interior_mask)) >= max(200, int(pigment_area * 0.35)):
+                pigment_mask = interior_mask
 
         sampled_rgb = eff_rgb[pigment_mask]
         sampled_w = darkness[pigment_mask].astype(np.float32)
@@ -1166,58 +1296,82 @@ class EvolutionCoordinator:
         selected_cand = [first_idx]
         min_dists = dists_all[:, first_idx].copy()
 
-        # 2-й .. N-й цвета: жадное покрытие неохваченных цветовых кластеров изображения с порогом различимости ΔE >= 15
-        for _ in range(n - 1):
-            # Усиливаем вес пикселей, которые плохо объясняются уже выбранными цветами
+        # 2-й .. N-й цвета: жадное покрытие реальных цветовых кластеров с порогом CIEDE2000 >= min_de00
+        # Без фантомной подстановки: если все кластеры уже охвачены, останавливаемся естественным образом.
+        cand_de_cache: Dict[int, np.ndarray] = {}
+        min_win_px = max(10, int(len(sampled_lab) * 0.005))
+        for _ in range(max(0, int(n) - 1)):
             unexplained_w = sampled_w * np.clip(min_dists / 25.0, 0.25, 2.5)
             gains = np.sum(unexplained_w[:, np.newaxis] * np.maximum(0.0, min_dists[:, np.newaxis] - dists_all), axis=0)
             for s in selected_cand:
                 gains[s] = -1.0
-                dist_s = np.sqrt(np.sum((cand_lab - cand_lab[s]) ** 2, axis=-1))
-                gains[dist_s < 15.0] = -1.0
+                if s not in cand_de_cache:
+                    cand_de_cache[s] = self._ciede2000_vec(cand_lab[s], cand_lab)
+                gains[cand_de_cache[s] < min_de00] = -1.0
 
             best_idx = int(np.argmax(gains))
-            if gains[best_idx] <= 0:
-                rem = [i for i in range(len(cand_colors)) if i not in selected_cand]
-                if not rem:
-                    break
-                cand_dist_to_sel = np.min([np.sqrt(np.sum((cand_lab[rem] - cand_lab[s]) ** 2, axis=-1)) for s in selected_cand], axis=0)
-                best_idx = rem[int(np.argmax(cand_dist_to_sel))]
+            if gains[best_idx] <= 0.0:
+                break
+            won_px = int(np.sum(dists_all[:, best_idx] < (min_dists - 1.5)))
+            if won_px < min_win_px and len(selected_cand) >= min(2, int(n)):
+                break
 
             selected_cand.append(best_idx)
             min_dists = np.minimum(min_dists, dists_all[:, best_idx])
 
-        # k-medoids уточнение: каждый выбранный цвет центрируется по своему кластеру пикселей,
-        # при этом для цветных кластеров отдается предпочтение чистым насыщенным нитям каталога
-        # (в субтрактивном синтезе на белом холсте насыщенная нить передает и яркие, и светлые полутона за счет шага нитей)
+        # k-medoids уточнение: каждый выбранный цвет центрируется по своему реальному кластеру
+        min_cl_px = max(8, int(len(sampled_lab) * 0.004))
         sel_arr = list(selected_cand)
         for _ in range(3):
             sub_dists = dists_all[:, sel_arr]  # (N, M)
             nearest = np.argmin(sub_dists, axis=1)
             for m_i in range(len(sel_arr)):
                 cl_mask = nearest == m_i
-                if np.sum(cl_mask) < max(8, len(sampled_lab) // (len(sel_arr) * 14)):
-                    worst_thresh = float(np.percentile(np.min(sub_dists, axis=1), 82))
-                    cl_mask = np.min(sub_dists, axis=1) >= worst_thresh
-                if np.any(cl_mask):
-                    cl_lab = sampled_lab[cl_mask]
-                    cl_w = sampled_w[cl_mask]
-                    # Целевой цвет кластера со сдвигом к насыщенным/контрастным пикселям кластера
-                    cl_chroma = np.sqrt(cl_lab[:, 1] ** 2 + cl_lab[:, 2] ** 2)
-                    vivid_w = cl_w * (1.0 + 0.35 * (cl_chroma / (np.max(cl_chroma) + 1e-4)))
-                    target_l = float(np.percentile(cl_lab[:, 0], 30)) if not invert_board else float(np.percentile(cl_lab[:, 0], 70))
-                    target_a = float(np.sum(vivid_w * cl_lab[:, 1]) / (np.sum(vivid_w) + 1e-6)) * 1.12
-                    target_b = float(np.sum(vivid_w * cl_lab[:, 2]) / (np.sum(vivid_w) + 1e-6)) * 1.12
-                    target_vec = np.array([target_l, target_a, target_b], dtype=np.float32)
+                if int(np.sum(cl_mask)) < min_cl_px:
+                    continue
+                cl_lab = sampled_lab[cl_mask]
+                cl_w = sampled_w[cl_mask]
+                cl_chroma = np.sqrt(cl_lab[:, 1] ** 2 + cl_lab[:, 2] ** 2)
+                vivid_w = cl_w * (1.0 + 0.35 * (cl_chroma / (np.max(cl_chroma) + 1e-4)))
+                target_l = float(np.percentile(cl_lab[:, 0], 30)) if not invert_board else float(np.percentile(cl_lab[:, 0], 70))
+                target_a = float(np.sum(vivid_w * cl_lab[:, 1]) / (np.sum(vivid_w) + 1e-6)) * 1.12
+                target_b = float(np.sum(vivid_w * cl_lab[:, 2]) / (np.sum(vivid_w) + 1e-6)) * 1.12
+                target_vec = np.array([target_l, target_a, target_b], dtype=np.float32)
 
-                    cl_losses = np.sqrt(np.sum((cand_lab - target_vec[np.newaxis, :]) ** 2, axis=-1))
-                    for other_i, other_c in enumerate(sel_arr):
-                        if other_i != m_i:
-                            d_other = np.sqrt(np.sum((cand_lab - cand_lab[other_c]) ** 2, axis=-1))
-                            cl_losses[d_other < 15.0] = np.inf
-                    best_medoid = int(np.argmin(cl_losses))
-                    if np.isfinite(cl_losses[best_medoid]):
-                        sel_arr[m_i] = best_medoid
+                cl_losses = np.sqrt(np.sum((cand_lab - target_vec[np.newaxis, :]) ** 2, axis=-1))
+                for other_i, other_c in enumerate(sel_arr):
+                    if other_i != m_i:
+                        d_other = self._ciede2000_vec(cand_lab[other_c], cand_lab)
+                        cl_losses[d_other < min_de00] = np.inf
+                best_medoid = int(np.argmin(cl_losses))
+                if np.isfinite(cl_losses[best_medoid]):
+                    sel_arr[m_i] = best_medoid
+
+        # Отсев пустых кластеров после уточнения и финальная дедупликация по CIEDE2000
+        sub_dists = dists_all[:, sel_arr]
+        nearest = np.argmin(sub_dists, axis=1)
+        cl_weights = [
+            (m_i, int(np.sum(nearest == m_i)), float(np.sum(sampled_w[nearest == m_i])))
+            for m_i in range(len(sel_arr))
+        ]
+        min_keep_px = max(6, int(len(sampled_lab) * 0.004))
+        kept_indices = [m_i for m_i, cnt, _ in cl_weights if cnt >= min_keep_px]
+        if len(kept_indices) < min(2, len(sel_arr)):
+            ranked = sorted(cl_weights, key=lambda x: (x[2], x[1]), reverse=True)
+            kept_indices = [x[0] for x in ranked[: min(2, len(sel_arr))]]
+
+        weight_by_mi = {m_i: w_tot for m_i, _, w_tot in cl_weights}
+        kept_sorted = sorted(kept_indices, key=lambda m_i: weight_by_mi[m_i], reverse=True)
+        final_cand: List[int] = []
+        for m_i in kept_sorted:
+            c_idx = sel_arr[m_i]
+            if any(
+                float(self._ciede2000_vec(cand_lab[c_idx], cand_lab[fc_idx : fc_idx + 1])[0]) < min_de00 * 0.95
+                for fc_idx in final_cand
+            ):
+                continue
+            final_cand.append(c_idx)
+        sel_arr = final_cand
 
         # Сортировка слоев от светлых тонов к темным (на белом холсте темные нити поверх светлых создают четкие контуры)
         result = [cand_colors[i] for i in sel_arr]
@@ -1435,12 +1589,14 @@ class EvolutionCoordinator:
         self.ui_manager.widgets["status_label"].config(text=data["text"])
         layers_snap = data["layers"]
         active_idx = data.get("active_idx", 0)
+        prev_count = len(self.state.layers)
         self.state.layers = layers_snap
         self.state.active_layer_idx = active_idx
         active_path = layers_snap[active_idx].get("path", []) if active_idx < len(layers_snap) else []
         self.state.overall_best_chromosome = active_path
         self.best_chromosomes_by_key["overall"] = layers_snap
         self.ui_manager.update_layer_selector()
+        self.ui_manager.refresh_palette_tab(throttle_s=0.0 if len(layers_snap) != prev_count else 0.8)
 
         max_steps = max(1, len(active_path) - 1)
         scale = self.ui_manager.widgets.get("step_scrubber_scale")
@@ -1589,6 +1745,7 @@ class EvolutionCoordinator:
 
         self._finalize_run()
         self.ui_manager.update_layer_selector()
+        self.ui_manager.refresh_palette_tab()
         total_lines = sum(max(0, len(l.get("path", [])) - 1) for l in self.state.layers)
         if len(self.state.layers) > 1:
             per_layer = " ".join(
@@ -1717,7 +1874,10 @@ class EvolutionCoordinator:
                     total_removed += rem
 
             if is_adaptive:
-                kept = [l for l in self.state.layers if len(l.get("path", [])) >= 2]
+                min_prune_threads = max(5, min(15, max_lines // 40))
+                kept = [l for l in self.state.layers if max(0, len(l.get("path", [])) - 1) >= min_prune_threads]
+                if not kept:
+                    kept = [l for l in self.state.layers if len(l.get("path", [])) >= 2]
                 if len(kept) != len(self.state.layers):
                     removed_empty_layers = True
                     self.state.layers = kept
@@ -1768,6 +1928,7 @@ class EvolutionCoordinator:
                 scale.configure(to=max(10, max_steps))
             self.state.vars["step_scrubber"].set(max_steps)
             self.ui_manager.update_layer_selector()
+            self.ui_manager.refresh_palette_tab()
             self.ui_manager.update_player_step_label()
 
             if self.state.layers:

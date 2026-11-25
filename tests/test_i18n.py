@@ -10,9 +10,17 @@ from PIL import Image
 
 from string_art_studio import TOOLTIPS
 from string_art_studio.audio import AudioAssistant
-from string_art_studio.color_catalog import COLOR_CATALOG, COLOR_NAME_EN, COLOR_NAME_RU
+from string_art_studio.color_catalog import (
+    COLOR_CATALOG,
+    COLOR_NAME_EN,
+    COLOR_NAME_RU,
+    find_catalog_match,
+    rgb_lightness_pct,
+    rgb_to_cmyk_pct,
+)
 from string_art_studio.geometry import CanvasManager
 from string_art_studio.i18n import (
+    COLOR_GROUP_EN,
     COLOR_MODE_EN,
     LAYER_NAME_EN,
     METRIC_EN,
@@ -37,6 +45,7 @@ from string_art_studio.i18n import (
     to_display_preset,
     to_display_shape,
     tr,
+    translate_color_group,
     translate_layer_name,
 )
 from string_art_studio.preprocessing import auto_recommend_parameters
@@ -166,6 +175,27 @@ class TestI18n(unittest.TestCase):
         self.assertNotEqual(layer_short_code("Темный желтовато-коричневый", "ru"), "Ж")
         code_en = layer_short_code("Темный желтовато-коричневый", "en")
         self.assertIsNone(cyr_re.search(code_en))
+
+        for entry in COLOR_CATALOG:
+            grp = entry.get("group", "")
+            self.assertIn(grp, COLOR_GROUP_EN)
+            self.assertIsNone(cyr_re.search(translate_color_group(grp, "en")))
+        self.assertEqual(translate_color_group("Красные", "en"), "Reds")
+        self.assertEqual(translate_color_group("Красные", "ru"), "Красные")
+
+        exact_entry, exact_de = find_catalog_match("Абрикосовый", (251, 206, 177))
+        self.assertIsNotNone(exact_entry)
+        self.assertEqual(exact_entry["name"], "Абрикосовый")
+        self.assertEqual(exact_de, 0.0)
+
+        near_entry, near_de = find_catalog_match("Циан (Cyan)", (0, 174, 239))
+        self.assertIsNotNone(near_entry)
+        self.assertGreater(near_de, 0.0)
+
+        self.assertEqual(rgb_to_cmyk_pct(255, 0, 0), (0, 100, 100, 0))
+        self.assertEqual(rgb_to_cmyk_pct(0, 0, 0), (0, 0, 0, 100))
+        self.assertAlmostEqual(rgb_lightness_pct(0, 0, 0), 0.0, places=2)
+        self.assertAlmostEqual(rgb_lightness_pct(255, 255, 255), 100.0, places=1)
 
 
 if __name__ == "__main__":
