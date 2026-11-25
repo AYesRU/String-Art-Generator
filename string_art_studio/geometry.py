@@ -394,9 +394,9 @@ class CanvasManager:
     @staticmethod
     def get_line_alpha(num_lines: int, line_weight_percent: int = 72) -> float:
         """Оптическая плотность одной нити (единая калибровка для оптимизатора и рендера)."""
-        base = (line_weight_percent / 100.0) * 0.22
-        line_scale = min(1.25, max(0.75, 1400.0 / max(400, int(num_lines))))
-        return float(np.clip(base * line_scale, 0.08, 0.36))
+        base = (line_weight_percent / 100.0) * 0.165
+        line_scale = min(1.30, max(0.42, (1200.0 / max(400, int(num_lines))) ** 0.55))
+        return float(np.clip(base * line_scale, 0.045, 0.26))
 
     def chromosome_to_lids(self, chromosome: List[int]) -> np.ndarray:
         """Преобразует путь гвоздей в массив индексов хорд CSR (игнорирует невалидные переходы)."""

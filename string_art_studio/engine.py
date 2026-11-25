@@ -15,6 +15,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 from . import (
@@ -184,7 +185,7 @@ def evaluate_chromosome_1d_np(
     diff = target_darkness - cur_dark
     over_mult = 1.0 + fearless_penalty * 1.8
     err = np.where(cur_dark > target_darkness, (diff * diff) * importance * over_mult, (diff * diff) * importance)
-    return 1.0 - (float(np.sum(err)) / float(flat_size))
+    return 1.0 - (float(np.sum(err, dtype=np.float64)) / float(flat_size))
 
 
 def _compute_delta_chords_np(
@@ -260,7 +261,7 @@ def _compute_delta_chords_np(
     diff_n = t - n_dark
     err_o = (diff_o * diff_o) * w * np.where(o_dark > t, over_mult, 1.0)
     err_n = (diff_n * diff_n) * w * np.where(n_dark > t, over_mult, 1.0)
-    delta_err = float(np.sum(err_n - err_o))
+    delta_err = float(np.sum(err_n, dtype=np.float64) - np.sum(err_o, dtype=np.float64))
     return delta_err, af, nd
 
 
@@ -536,7 +537,7 @@ class FitnessCalculator:
             (diff * diff) * self.importance_flat * over_mult,
             (diff * diff) * self.importance_flat,
         )
-        return float(np.sum(err))
+        return float(np.sum(err, dtype=np.float64))
 
     def calculate_single_fitness(self, chromosome: List[int]) -> float:
         if not chromosome or len(chromosome) < 2:
@@ -655,7 +656,7 @@ class GreedyInitializer:
 
         chord_lengths = np.asarray(A.indptr[1:] - A.indptr[:-1], dtype=np.float32)
         chord_lengths_safe = np.maximum(1.0, chord_lengths)
-        inv_norm_denom = (1.0 / (chord_lengths_safe ** 0.85)).astype(np.float32)
+        inv_norm_denom = (1.0 / (chord_lengths_safe ** 0.35)).astype(np.float32)
 
         radon_vec: Optional[np.ndarray] = None
         if self.radon_guide is not None and len(self.radon_guide.chord_weights) == n_chords and radon_inf > 0:
@@ -808,6 +809,265 @@ class GreedyInitializer:
         return path
 
 
+class JointRGBGreedyInitializer:
+    """
+    Совместный 3-канальный Beer-Lambert RGB OMP для многоцветного адаптивного режима:
+    - Ведет общую оптическую глубину d_rgb (R, G, B) одновременно по всем выбранным нитям;
+    - Оптимизирует взвешенную ошибку яркости и цветности (chrominance boost), чтобы цветные области
+      не перетемнялись черными/коричневыми нитями;
+    - Использует 1-шаговые переходы (мосты), чтобы не бросать изолированные детали и листья.
+    """
+
+    def __init__(
+        self,
+        canvas_manager: CanvasManager,
+        rgb_norm: np.ndarray,
+        mask: np.ndarray,
+        selected_colors: List[Dict[str, Any]],
+        config: Dict[str, Any],
+        invert_board: bool = False,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ):
+        self.canvas_manager = canvas_manager
+        self.canvas_manager.build_line_tables()
+        self.rgb_norm = np.clip(rgb_norm.astype(np.float32, copy=False), 0.0, 1.0)
+        self.mask = mask
+        self.selected_colors = list(selected_colors)
+        self.config = config
+        self.invert_board = bool(invert_board)
+        self.stop_check = stop_check
+        self.num_pins = canvas_manager.num_pins
+
+    def run(
+        self,
+        update_callback: Callable[[str, List[Dict[str, Any]], int], None],
+    ) -> Tuple[List[List[int]], float]:
+        K = len(self.selected_colors)
+        max_lines = max(1, int(self.config.get("lines", 1400)))
+        line_weight = int(self.config.get("line_weight", 72))
+        lang = normalize_lang(self.config.get("language", "ru"))
+        if (
+            K == 0
+            or self.num_pins == 0
+            or self.canvas_manager.line_matrix is None
+            or self.canvas_manager.line_matrix.shape[0] == 0
+        ):
+            return [[] for _ in range(K)], 0.0
+
+        A = self.canvas_manager.line_matrix
+        pin_sub_matrices = self.canvas_manager.ensure_pin_sub_matrices()
+        n_chords = A.shape[0]
+        a_indices = A.indices
+        a_indptr = A.indptr
+        h, w, _ = self.rgb_norm.shape
+        flat_size = h * w
+
+        alpha = self.canvas_manager.get_line_alpha(max_lines, line_weight)
+        fearless = float(self.config.get("fearless_factor", 94)) / 100.0
+        over_mult = 1.0 + fearless * 1.15
+        chroma_boost = 2.4
+        contour_w = float(self.config.get("contour_weight", 55)) / 100.0
+
+        gray = 0.299 * self.rgb_norm[:, :, 0] + 0.587 * self.rgb_norm[:, :, 1] + 0.114 * self.rgb_norm[:, :, 2]
+        blur_g = cv2.GaussianBlur(gray, (3, 3), 0)
+        gx = cv2.Sobel(blur_g, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(blur_g, cv2.CV_32F, 0, 1, ksize=3)
+        edges_g = np.hypot(gx, gy)
+        m_2d = self.mask.reshape((h, w)) == 255
+        edges_g = np.where(m_2d, edges_g, 0.0)
+        edges_g /= max(1e-5, float(np.max(edges_g)))
+
+        if not self.invert_board:
+            target_rgb_flat = self.rgb_norm.reshape(-1, 3).astype(np.float32)
+            subj_act = np.maximum(1.0 - gray, 0.85 * (1.0 - np.min(self.rgb_norm, axis=-1)))
+            da_list = [
+                alpha * np.clip(1.0 - np.array(sc["rgb"], dtype=np.float32) / 255.0, 0.0, 1.0)
+                for sc in self.selected_colors
+            ]
+        else:
+            target_rgb_flat = (1.0 - self.rgb_norm).reshape(-1, 3).astype(np.float32)
+            subj_act = np.maximum(gray, 0.85 * np.max(self.rgb_norm, axis=-1))
+            da_list = [
+                alpha * np.clip(np.array(sc["rgb"], dtype=np.float32) / 255.0, 0.0, 1.0)
+                for sc in self.selected_colors
+            ]
+
+        imp_rgb = np.where(m_2d, 0.48 + subj_act * 2.1 + edges_g * (2.2 + 2.2 * contour_w), 0.15).flatten().astype(np.float32)
+        d_rgb = np.zeros((flat_size, 3), dtype=np.float32)
+
+        def _pix_err(c_arr: np.ndarray, t_arr: np.ndarray) -> np.ndarray:
+            diff = c_arr - t_arr
+            over_w = np.where(c_arr < t_arr, over_mult, 1.0)
+            dy = diff[:, 0] * 0.299 + diff[:, 1] * 0.587 + diff[:, 2] * 0.114
+            dc = diff - dy[:, np.newaxis]
+            base_e = np.sum((diff * diff) * over_w, axis=1)
+            chroma_e = np.sum((dc * dc) * over_w, axis=1) * chroma_boost
+            return base_e + chroma_e
+
+        def _calc_gain_k(d_slice: np.ndarray, t_slice: np.ndarray, w_slice: np.ndarray, da: np.ndarray) -> np.ndarray:
+            c0 = np.exp(-1.6 * d_slice)
+            c1 = np.exp(-1.6 * (d_slice + da))
+            return ((_pix_err(c0, t_slice) - _pix_err(c1, t_slice)) * w_slice).astype(np.float32)
+
+        pg_list = [_calc_gain_k(d_rgb, target_rgb_flat, imp_rgb, da) for da in da_list]
+        paths: List[List[int]] = []
+        cur_pins: List[int] = []
+        used_list = [np.zeros(n_chords, dtype=bool) for _ in range(K)]
+        recent_pins = [deque() for _ in range(K)]
+        recent_counts = [np.zeros(self.num_pins, dtype=np.int32) for _ in range(K)]
+        active = [True] * K
+        bridges_left = [16] * K
+
+        for k in range(K):
+            ir = A.dot(pg_list[k])
+            if float(np.max(ir)) <= 1e-5:
+                paths.append([])
+                cur_pins.append(0)
+                active[k] = False
+            else:
+                lid0 = int(np.argmax(ir))
+                p0 = self.canvas_manager.line_keys[lid0][0]
+                paths.append([p0])
+                cur_pins.append(p0)
+
+        max_total_lines = int(round(max_lines * min(3.2, 1.3 + 0.35 * K)))
+        total_added = 0
+        t0 = time.perf_counter()
+        last_ui = t0
+
+        def _emit_progress() -> None:
+            layers_snap = [
+                {
+                    "name": self.selected_colors[k]["name"],
+                    "color_hex": self.selected_colors[k]["hex"],
+                    "path": list(paths[k]),
+                    "ref_lines": max_lines,
+                }
+                for k in range(K)
+            ]
+            rate = total_added / max(0.001, time.perf_counter() - t0)
+            msg = (
+                f"Joint RGB OMP: {total_added} threads ({rate:.0f} l/s)"
+                if lang == "en"
+                else f"Совместный RGB OMP: {total_added} нитей ({rate:.0f} лин/с)"
+            )
+            update_callback(msg, layers_snap, -1 if K > 1 else 0)
+
+        pin_neighbor_pins = self.canvas_manager.pin_neighbor_pins
+        pin_neighbor_lids = self.canvas_manager.pin_neighbor_lids
+
+        while total_added < max_total_lines and any(active):
+            if self.stop_check and self.stop_check():
+                break
+
+            best_k = -1
+            best_raw = 1e-5
+            best_lid = -1
+            best_next = -1
+
+            for k in range(K):
+                if not active[k]:
+                    continue
+                if len(paths[k]) - 1 >= max_lines:
+                    active[k] = False
+                    continue
+                cp = cur_pins[k]
+                lids = pin_neighbor_lids[cp]
+                pins = pin_neighbor_pins[cp]
+                if len(lids) == 0:
+                    active[k] = False
+                    continue
+                cand_mask = ~used_list[k][lids]
+                if recent_pins[k]:
+                    mask_rec = cand_mask & (recent_counts[k][pins] == 0)
+                    if np.any(mask_rec):
+                        cand_mask = mask_rec
+                if not np.any(cand_mask):
+                    active[k] = False
+                    continue
+
+                raw = pin_sub_matrices[cp].dot(pg_list[k])
+                raw_m = np.where(cand_mask, raw, -np.inf)
+                bi = int(np.argmax(raw_m))
+                braw = float(raw_m[bi])
+                if braw > best_raw:
+                    best_raw = braw
+                    best_k = k
+                    best_lid = int(lids[bi])
+                    best_next = int(pins[bi])
+                elif braw <= 1e-5 and bridges_left[k] > 0:
+                    ir_k = A.dot(pg_list[k])
+                    ir_k[used_list[k]] = -np.inf
+                    tlid = int(np.argmax(ir_k))
+                    tgain = float(ir_k[tlid])
+                    if tgain > 1e-3:
+                        tp1, tp2 = self.canvas_manager.line_keys[tlid]
+                        blid = self.canvas_manager.line_dict.get((cp, tp1))
+                        bnext = tp1
+                        if blid is None or used_list[k][blid]:
+                            blid = self.canvas_manager.line_dict.get((cp, tp2))
+                            bnext = tp2
+                        if blid is not None and not used_list[k][blid]:
+                            bpix = a_indices[a_indptr[blid] : a_indptr[blid + 1]]
+                            bgain = float(np.sum(pg_list[k][bpix]))
+                            net_2hop = bgain + tgain
+                            if net_2hop > best_raw:
+                                best_raw = net_2hop
+                                best_k = k
+                                best_lid = blid
+                                best_next = bnext
+                        else:
+                            bridges_left[k] = 0
+                    else:
+                        active[k] = False
+
+            if best_k < 0:
+                break
+
+            pix = a_indices[a_indptr[best_lid] : a_indptr[best_lid + 1]]
+            prev_gain = float(np.sum(pg_list[best_k][pix]))
+            if prev_gain <= 1e-5:
+                bridges_left[best_k] = max(0, bridges_left[best_k] - 1)
+
+            d_rgb[pix] += da_list[best_k]
+            d_sub = d_rgb[pix]
+            t_sub = target_rgb_flat[pix]
+            w_sub = imp_rgb[pix]
+            for k in range(K):
+                if active[k]:
+                    pg_list[k][pix] = _calc_gain_k(d_sub, t_sub, w_sub, da_list[k])
+
+            used_list[best_k][best_lid] = True
+            cp_old = cur_pins[best_k]
+            paths[best_k].append(best_next)
+            recent_pins[best_k].append(cp_old)
+            recent_counts[best_k][cp_old] += 1
+            if len(recent_pins[best_k]) > 4:
+                old_p = recent_pins[best_k].popleft()
+                recent_counts[best_k][old_p] -= 1
+            cur_pins[best_k] = best_next
+            total_added += 1
+
+            now = time.perf_counter()
+            if (total_added <= 20 or now - last_ui > 0.12) and total_added > 0:
+                _emit_progress()
+                last_ui = now
+
+        _emit_progress()
+        cur_rgb = np.exp(-1.6 * d_rgb)
+        mse_3 = float(np.mean((cur_rgb - target_rgb_flat) ** 2))
+        joint_fit = float(np.clip(1.0 - mse_3, 0.0, 1.0))
+        logging.info(
+            "Joint RGB OMP завершен (%d цв., alpha=%.4f): всего %d нитей (фитнес %.5f) за %.2f сек.",
+            K,
+            alpha,
+            total_added,
+            joint_fit,
+            time.perf_counter() - t0,
+        )
+        return paths, joint_fit
+
+
 def optimize_thread_count_delta(
     chromosome: List[int],
     fitness_calculator: FitnessCalculator,
@@ -936,7 +1196,7 @@ def optimize_thread_count_delta(
         n_chords = A.shape[0]
         radon_inf = (fitness_calculator.config.get("radon_influence", 35) / 100.0) * 0.22
         chord_lengths = np.maximum(1.0, (A.indptr[1:] - A.indptr[:-1]).astype(np.float32))
-        inv_norm = (1.0 / (chord_lengths ** 0.85)).astype(np.float32)
+        inv_norm = (1.0 / (chord_lengths ** 0.35)).astype(np.float32)
         pin_inv_norm = [inv_norm[lids] for lids in cm.pin_neighbor_lids]
         radon_vec = (
             (1.0 + radon_inf * radon_guide.chord_weights).astype(np.float32)

@@ -26,6 +26,7 @@ from .engine import (
     FitnessCalculator,
     GreedyInitializer,
     IslandManagerThread,
+    JointRGBGreedyInitializer,
     estimate_channel_line_budget,
     optimize_thread_count_delta,
     prune_chromosome_loops,
@@ -355,7 +356,7 @@ class EvolutionCoordinator:
 
     @staticmethod
     def _preprocess_rgb_for_adaptive(rgb_img: np.ndarray, config: Dict[str, Any], invert_board: bool) -> np.ndarray:
-        rgb_smooth = cv2.bilateralFilter(rgb_img, d=5, sigmaColor=18, sigmaSpace=18)
+        rgb_smooth = cv2.bilateralFilter(rgb_img, d=3, sigmaColor=10, sigmaSpace=10)
         gamma_val = float(config.get("gamma", 1.0))
         if abs(gamma_val - 1.0) > 0.03:
             inv_gamma = 1.0 / max(0.1, gamma_val) if not invert_board else gamma_val
@@ -966,126 +967,52 @@ class EvolutionCoordinator:
                 mask = bundle.get("mask", np.ones_like(bundle["gray"], dtype=np.uint8) * 255)
                 invert_board = bool(bundle.get("invert_board", False))
                 max_lines = int(config["lines"])
-                line_weight = int(config.get("line_weight", 72))
 
-                # Предобработка исходного изображения под цветоделение (сглаживание шума и гамма)
+                # Легкое сглаживание с сохранением 2px контуров и темной обводки
                 rgb_smooth = self._preprocess_rgb_for_adaptive(rgb_img, config, invert_board)
                 rgb_norm = np.clip(rgb_smooth.astype(np.float32) / 255.0, 0.0, 1.0)
-                total_activity = self._compute_total_activity(rgb_norm, invert_board)
 
                 # 1) Подбор до N перцептивно различимых (CIEDE2000) цветов из каталога
                 selected_colors = self._select_adaptive_colors(rgb_smooth, n_colors, mask=mask, invert_board=invert_board)
-
-                # 2) Физическое трехканальное цветоделение Бера-Ламберта (согласованное с render_layers_to_numpy)
-                channel_densities = self._decompose_adaptive_channels(rgb_norm, selected_colors, mask, invert_board=invert_board)
-
-                # 2.5) Предсинтезная консолидация: отсеиваем слабые/малочисленные цвета и перераспределяем их пиксели
-                mask_area = max(1, int(np.sum(mask == 255)))
-                min_px_area = max(80, int(mask_area * 0.002))
-                strong_idx = [
-                    i
-                    for i, d_map in enumerate(channel_densities)
-                    if int(np.sum(d_map > 0.06)) >= min_px_area
-                    and estimate_channel_line_budget(d_map, mask, cm, max_lines, line_weight) >= 12
-                ]
-                if 0 < len(strong_idx) < len(selected_colors):
-                    selected_colors = [selected_colors[i] for i in strong_idx]
-                    channel_densities = self._decompose_adaptive_channels(
-                        rgb_norm, selected_colors, mask, invert_board=invert_board
-                    )
-
                 self.queues["status_queue"].put({"type": "palette_update", "run_id": run_id, "data": selected_colors})
 
-                # 3) Оценка физической потребности каждого слоя
-                phys_budgets, ch_budgets = self._compute_adaptive_budgets(
-                    channel_densities, mask, cm, max_lines, line_weight
+                # 2) Совместный 3-канальный Beer-Lambert RGB OMP по всем цветам одновременно
+                def _joint_cb(status_msg: str, layers_snap: List[Dict[str, Any]], active_idx: int) -> None:
+                    self.queues["status_queue"].put({
+                        "type": "greedy_update",
+                        "run_id": run_id,
+                        "data": {"text": status_msg, "layers": layers_snap, "active_idx": active_idx},
+                    })
+
+                joint_omp = JointRGBGreedyInitializer(
+                    cm,
+                    rgb_norm,
+                    mask,
+                    selected_colors,
+                    config,
+                    invert_board=invert_board,
+                    stop_check=self._check_omp_stop_or_pause,
                 )
+                joint_paths, joint_fit = joint_omp.run(_joint_cb)
+                self.state.omp_baseline_fitness = joint_fit
+                self.state.overall_best_fitness = joint_fit
+
                 min_layer_threads = max(5, min(15, max_lines // 40))
+                raw_layers = []
+                for sc, path in zip(selected_colors, joint_paths):
+                    cleaned, _ = prune_chromosome_loops(path)
+                    raw_layers.append({
+                        "name": sc["name"],
+                        "color_hex": sc["hex"],
+                        "path": cleaned,
+                        "ref_lines": max_lines,
+                    })
 
-                logging.info(
-                    "Адаптивный режим (%d/%d цв.): физ. потребность=%s, бюджеты=%s (сумма=%d при лимите=%d)",
-                    len(selected_colors), n_colors, phys_budgets, ch_budgets, sum(ch_budgets), max_lines,
-                )
-
-                for c_idx, sc in enumerate(selected_colors):
-                    if self.omp_stop_flag:
-                        break
-                    name_ru = sc["name"]
-                    disp_name = translate_layer_name(name_ru, lang)
-                    hex_c = sc["hex"]
-                    ch_budget = ch_budgets[c_idx]
-                    self._send_status(tr("st_adaptive_layer", lang, idx=c_idx + 1, n=len(selected_colors), name=disp_name), run_id=run_id)
-
-                    adapt_darkness = channel_densities[c_idx]
-                    if ch_budget < 10 or int(np.sum(adapt_darkness > 0.06)) < 40:
-                        logging.info(f"Слой '{disp_name}' не требует нитей (бюджет {ch_budget}) — пропуск.")
-                        continue
-
-                    adapt_edges, adapt_imp = self._compute_adaptive_importance(
-                        adapt_darkness, total_activity, mask, len(selected_colors)
-                    )
-
-                    fc = FitnessCalculator(
-                        bundle["gray"], adapt_edges, bundle["saliency"], adapt_imp,
-                        cm, config, self.queues, target_darkness_override=adapt_darkness,
-                    )
-                    self.active_fitness_calc = fc
-
-                    adapt_radon = (
-                        RadonGuide(bundle["gray"], adapt_edges, cm, config, compute_fbp=False, density_override=adapt_darkness)
-                        if radon_enabled else None
-                    )
-                    greedy = GreedyInitializer(cm, fc.target_darkness_flat, fc.importance_flat, config, adapt_radon, stop_Check=self._check_omp_stop_or_pause)
-
-                    layer_display_idx = len(accumulated_layers)
-                    def greedy_cb_adapt(status, path, _idx=layer_display_idx, _name=name_ru, _disp=disp_name, _hex=hex_c):
-                        snap = list(accumulated_layers)
-                        snap.append({"name": _name, "color_hex": _hex, "path": path, "ref_lines": max_lines})
-                        self.queues["status_queue"].put({
-                            "type": "greedy_update", "run_id": run_id,
-                            "data": {"text": f"{_disp}: {status}", "layers": snap, "active_idx": _idx},
-                        })
-
-                    # Используем единую оптическую плотность fc.line_alpha для полной согласованности с ГА, прунингом и рендером
-                    base_path = greedy.run(ch_budget, greedy_cb_adapt, layer_label=name_ru, line_alpha=fc.line_alpha)
-
-                    if len(base_path) >= 2 and not self.omp_stop_flag:
-                        self.state.omp_baseline_fitness = fc.calculate_single_fitness(base_path)
-                        self.state.layer_best_fitnesses[layer_display_idx] = self.state.omp_baseline_fitness - 1e-6
-                        adapt_stages = max(2, config.get("stages", 5) // 2)
-                        mgr = IslandManagerThread(
-                            config, self.queues, fc, base_path, adapt_radon,
-                            layer_idx=layer_display_idx, layer_name=name_ru, emit_done=False,
-                            stages_override=adapt_stages, patience_scale=0.55,
-                            run_id=run_id, max_lines=ch_budget,
-                        )
-                        self.manager_thread = mgr
-                        mgr.start()
-                        mgr.join()
-                        if mgr.best_result is not None and len(mgr.best_result.get("chromosome", [])) >= 2:
-                            base_path = list(mgr.best_result.get("chromosome", []))
-
-                        # Оптимизация и устранение избыточных/перетемняющих нитей (Delta pruning)
-                        pruned_path, opt_fit, n_rem, _ = optimize_thread_count_delta(
-                            base_path, fc, ch_budget, adapt_radon, max_prune_passes=2, allow_add=False,
-                        )
-                        if len(pruned_path) >= 2:
-                            base_path = pruned_path
-                            if n_rem > 0:
-                                logging.info(f"Слой '{disp_name}': устранено {n_rem} избыточных нитей")
-
-                    n_done = max(0, len(base_path) - 1)
-                    keep_fallback = len(accumulated_layers) == 0 and c_idx == len(selected_colors) - 1 and n_done >= 2
-                    if n_done >= min_layer_threads or keep_fallback:
-                        accumulated_layers.append({"name": name_ru, "color_hex": hex_c, "path": base_path, "ref_lines": max_lines})
-                        self.queues["status_queue"].put({
-                            "type": "greedy_update", "run_id": run_id,
-                            "data": {"text": tr("st_cmyk_layer_done", lang, name=disp_name, lines=n_done), "layers": list(accumulated_layers), "active_idx": len(accumulated_layers) - 1},
-                        })
-                    else:
-                        logging.info(
-                            f"Слой '{disp_name}' дал слишком мало нитей ({n_done} < {min_layer_threads}) и был исключен."
-                        )
+                accumulated_layers = [
+                    l for l in raw_layers if max(0, len(l.get("path", [])) - 1) >= min_layer_threads
+                ]
+                if not accumulated_layers:
+                    accumulated_layers = [l for l in raw_layers if len(l.get("path", [])) >= 2][:1]
 
                 self.state.layers = list(accumulated_layers)
                 active_palette = [
@@ -1097,6 +1024,18 @@ class EvolutionCoordinator:
                     for l in accumulated_layers
                 ]
                 self.queues["status_queue"].put({"type": "palette_update", "run_id": run_id, "data": active_palette})
+                final_active_idx = -1 if len(accumulated_layers) > 1 else 0
+                if accumulated_layers:
+                    self.queues["status_queue"].put({
+                        "type": "greedy_update",
+                        "run_id": run_id,
+                        "data": {
+                            "text": tr("st_adaptive_done", lang, n=len(accumulated_layers)),
+                            "layers": list(accumulated_layers),
+                            "active_idx": final_active_idx,
+                            "fitness": joint_fit,
+                        },
+                    })
 
                 if self.omp_stop_flag:
                     msg = tr("st_stopped_user", lang)
@@ -1223,10 +1162,11 @@ class EvolutionCoordinator:
             max_abs = 1.0 - np.min(cat_rgb, axis=-1)
             valid_indices = [
                 i for i in range(len(COLOR_CATALOG))
-                if cat_lab[i, 0] <= 78.0
-                and (3.0 - np.sum(cat_rgb[i])) >= 0.45
-                and max_abs[i] >= 0.35
-                and not (cat_chroma[i] < 10.0 and cat_lab[i, 0] > 55.0)
+                if (cat_lab[i, 0] <= 68.0 or cat_chroma[i] >= 52.0)
+                and cat_lab[i, 0] <= 86.0
+                and (3.0 - np.sum(cat_rgb[i])) >= 0.65
+                and max_abs[i] >= 0.45
+                and not (cat_chroma[i] < 22.0 and cat_lab[i, 0] > 38.0)
             ]
         else:
             max_emit = np.max(cat_rgb, axis=-1)
@@ -1267,20 +1207,24 @@ class EvolutionCoordinator:
         if np.sum(pigment_mask) < 10:
             pigment_mask = np.ones_like(darkness, dtype=bool)
 
-        # Подавление пикселей 1-2 px переходного сглаживания на границах объектов (ореолы смешивания)
+        # Подавление пикселей 1-2 px переходного сглаживания на границах объектов (ореолы смешивания),
+        # при этом темная/контрастная обводка (gray < 0.30) всегда сохраняется для точного подбора контурной нити
         pigment_area = int(np.sum(pigment_mask))
         if pigment_area >= 400:
             gx_rgb = cv2.Sobel(img_f32, cv2.CV_32F, 1, 0, ksize=3)
             gy_rgb = cv2.Sobel(img_f32, cv2.CV_32F, 0, 1, ksize=3)
             grad = np.max(np.hypot(gx_rgb, gy_rgb), axis=-1)
             grad_thresh = float(np.percentile(grad[pigment_mask], 80))
-            interior_mask = pigment_mask & (grad <= grad_thresh)
+            outline_mask = (gray < 0.30) if not invert_board else (gray > 0.70)
+            interior_mask = pigment_mask & ((grad <= grad_thresh) | outline_mask)
             if int(np.sum(interior_mask)) >= max(200, int(pigment_area * 0.35)):
                 pigment_mask = interior_mask
 
         sampled_rgb = eff_rgb[pigment_mask]
         sampled_w = darkness[pigment_mask].astype(np.float32)
         sampled_lab = self._rgb_to_lab(sampled_rgb)
+        if not invert_board:
+            sampled_w = np.where(sampled_lab[:, 0] < 28.0, sampled_w * 2.2, sampled_w)
 
         if len(sampled_lab) > 4096:
             step = len(sampled_lab) // 4096
@@ -1591,19 +1535,35 @@ class EvolutionCoordinator:
         active_idx = data.get("active_idx", 0)
         prev_count = len(self.state.layers)
         self.state.layers = layers_snap
-        self.state.active_layer_idx = active_idx
-        active_path = layers_snap[active_idx].get("path", []) if active_idx < len(layers_snap) else []
+        if active_idx < 0 and len(layers_snap) > 1:
+            self.state.active_layer_idx = -1
+            active_path = layers_snap[-1].get("path", [])
+            max_steps = max(1, sum(max(0, len(l.get("path", [])) - 1) for l in layers_snap))
+        else:
+            self.state.active_layer_idx = max(0, active_idx)
+            active_path = (
+                layers_snap[self.state.active_layer_idx].get("path", [])
+                if self.state.active_layer_idx < len(layers_snap)
+                else []
+            )
+            max_steps = max(1, len(active_path) - 1)
         self.state.overall_best_chromosome = active_path
         self.best_chromosomes_by_key["overall"] = layers_snap
         self.ui_manager.update_layer_selector()
         self.ui_manager.refresh_palette_tab(throttle_s=0.0 if len(layers_snap) != prev_count else 0.8)
 
-        max_steps = max(1, len(active_path) - 1)
         scale = self.ui_manager.widgets.get("step_scrubber_scale")
         if isinstance(scale, ttk.Scale):
             scale.configure(to=max(10, max_steps))
         self.state.vars["step_scrubber"].set(max_steps)
         self.ui_manager.update_player_step_label()
+
+        if "fitness" in data and float(data["fitness"]) > 0:
+            self.state.overall_best_fitness = float(data["fitness"])
+            self.ui_manager.update_best_fitness_display(self.state.overall_best_fitness)
+        if self.canvas_manager and layers_snap:
+            total_m = sum(self.canvas_manager.calculate_path_length_m(l.get("path", [])) for l in layers_snap)
+            self.ui_manager.update_thread_length_display(total_m)
 
         config = self.state.get_config()
         self.request_canvas_update(
