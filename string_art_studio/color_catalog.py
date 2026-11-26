@@ -12,31 +12,55 @@ COLOR_BY_NAME: Dict[str, Dict[str, Any]] = {c["name"]: c for c in COLOR_CATALOG}
 _CATALOG_LAB_CACHE: Optional[np.ndarray] = None
 
 
+_SRGB_TO_XYZ_M = np.array(
+    [
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041],
+    ],
+    dtype=np.float32,
+)
+_D65_WHITE = np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
+
+
+def rgb_to_lab_array(arr: np.ndarray) -> np.ndarray:
+    """Векторизованно преобразует sRGB [0.0..1.0] произвольной формы (..., 3) в CIE L*a*b* (D65)."""
+    arr_f = np.asarray(arr, dtype=np.float32)
+    mask_s = arr_f > 0.04045
+    lin = np.where(mask_s, ((arr_f + 0.055) / 1.055) ** 2.4, arr_f / 12.92)
+    shape = lin.shape
+    flat = (lin.reshape(-1, 3) @ _SRGB_TO_XYZ_M.T) / _D65_WHITE
+    eps = 0.008856
+    kappa = 903.3
+    fx = np.where(flat > eps, flat ** (1.0 / 3.0), (kappa * flat + 16.0) / 116.0)
+    L = 116.0 * fx[:, 1] - 16.0
+    a = 500.0 * (fx[:, 0] - fx[:, 1])
+    b = 200.0 * (fx[:, 1] - fx[:, 2])
+    return np.stack([L, a, b], axis=-1).reshape(shape[:-1] + (3,))
+
+
 def _rgb_to_lab(r: int, g: int, b: int) -> Tuple[float, float, float]:
     """Преобразует sRGB (0..255) в координаты CIE L*a*b* (D65)."""
-    vals = []
-    for ch in (r, g, b):
-        c = max(0.0, min(1.0, float(ch) / 255.0))
-        vals.append(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4)
-    rl, gl, bl = vals
-    x = (0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl) / 0.95047
-    y = (0.2126729 * rl + 0.7151522 * gl + 0.0721750 * bl) / 1.00000
-    z = (0.0193339 * rl + 0.1191920 * gl + 0.9503041 * bl) / 1.08883
-
-    def _f(t: float) -> float:
-        return t ** (1.0 / 3.0) if t > 0.008856 else 7.787 * t + (16.0 / 116.0)
-
-    fx, fy, fz = _f(x), _f(y), _f(z)
-    return (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+    arr = np.array(
+        [
+            max(0.0, min(1.0, float(r) / 255.0)),
+            max(0.0, min(1.0, float(g) / 255.0)),
+            max(0.0, min(1.0, float(b) / 255.0)),
+        ],
+        dtype=np.float32,
+    )
+    lab = rgb_to_lab_array(arr)
+    return (float(lab[0]), float(lab[1]), float(lab[2]))
 
 
 def _get_catalog_lab_matrix() -> np.ndarray:
     global _CATALOG_LAB_CACHE
     if _CATALOG_LAB_CACHE is None:
-        _CATALOG_LAB_CACHE = np.asarray(
-            [_rgb_to_lab(int(c["rgb"][0]), int(c["rgb"][1]), int(c["rgb"][2])) for c in COLOR_CATALOG],
+        rgb_arr = np.asarray(
+            [[c["rgb"][0], c["rgb"][1], c["rgb"][2]] for c in COLOR_CATALOG],
             dtype=np.float32,
-        )
+        ) / 255.0
+        _CATALOG_LAB_CACHE = rgb_to_lab_array(rgb_arr).astype(np.float32, copy=False)
     return _CATALOG_LAB_CACHE
 
 

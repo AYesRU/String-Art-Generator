@@ -176,6 +176,40 @@ class TestExporters(unittest.TestCase):
             self.assertNotIn('"Cyan"', html_en)  # 0-thread layer omitted from interactive player
             self.assertIn("Magenta", html_en)
 
+    def test_security_sanitization_scale_parity_and_pin_bounds(self):
+        cm = CanvasManager(size=500, num_pins=120, shape="Круг", physical_cm=50.0)
+        # Масштаб длины нити обязан совпадать с масштабом G-Code и шаблона 1:1
+        p_opposite = [0, 60]
+        len_mm = cm.calculate_path_length_m(p_opposite) * 1000.0
+        c0, c1 = cm.pin_coords[0], cm.pin_coords[60]
+        expected_mm = float(np.hypot(c1[0] - c0[0], c1[1] - c0[1])) * cm.mm_per_px()
+        self.assertAlmostEqual(len_mm, expected_mm, places=3)
+
+        evil_layers = [
+            {"name": "</script><script>alert(1)</script>", "color_hex": '#000" onload="alert(1)', "path": [0, 60, 999, -5, 30]},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            svg_p = os.path.join(tmp, "safe.svg")
+            txt_p = os.path.join(tmp, "safe.txt")
+            csv_p = os.path.join(tmp, "safe.csv")
+            gc_p = os.path.join(tmp, "safe.gcode")
+
+            export_svg_vector(svg_p, evil_layers, cm)
+            with open(svg_p, encoding="utf-8") as f:
+                svg_data = f.read()
+            self.assertNotIn('onload="alert(1)', svg_data)
+            self.assertIn('stroke="#111111"', svg_data)
+
+            # Индексы вне [0, num_pins) не должны вызывать IndexError
+            total_m = export_instructions_txt(txt_p, evil_layers, cm)
+            self.assertGreater(total_m, 0.0)
+            export_csv(csv_p, evil_layers, cm)
+            export_gcode_cnc(gc_p, evil_layers, cm)
+
+            html_safe = build_interactive_html5_assistant("Safe", cm, evil_layers)
+            self.assertNotIn("</script><script>alert(1)</script>", html_safe)
+            self.assertIn("<\\/script><script>alert(1)<\\/script>", html_safe)
+
 
 if __name__ == "__main__":
     unittest.main()

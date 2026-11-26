@@ -61,7 +61,7 @@ from .i18n import (
 )
 from .preprocessing import _compute_channel_edges_and_importance, prepare_target_image_bundle
 from .radon import RadonGuide
-from .color_catalog import COLOR_CATALOG
+from .color_catalog import COLOR_CATALOG, rgb_to_lab_array
 
 if TYPE_CHECKING:
     from .ui import StringArtApp, UIManager
@@ -294,24 +294,22 @@ class EvolutionCoordinator:
                         if len(path_main) >= 2:
                             _, diff_map, depth_2d = self.active_fitness_calc.calculate_single_fitness_and_maps(path_main)
                             self._push_analytic_maps(diff_map, depth_2d)
-                    elif active_layer_idx < 0 and layers_data and self.canvas_manager.flat_ready:
+                    elif layers_data and self.canvas_manager.flat_ready:
+                        target_subset = (
+                            layers_data
+                            if active_layer_idx < 0
+                            else [layers_data[min(active_layer_idx, len(layers_data) - 1)]]
+                        )
                         flat_size = self.canvas_manager.size * self.canvas_manager.size
                         depth_comp = np.zeros(flat_size, dtype=np.float32)
-                        for lyr in layers_data:
+                        for lyr in target_subset:
                             p = lyr.get("path", [])
                             tot_l = max(0, len(p) - 1)
                             if tot_l == 0:
                                 continue
                             ref_n = max(400, int(lyr.get("ref_lines") or tot_l))
                             alpha_l = self.canvas_manager.get_line_alpha(ref_n, line_weight)
-                            hex_c = str(lyr.get("color_hex", "#111111")).lstrip("#")
-                            if len(hex_c) == 6:
-                                try:
-                                    rgb_c = [int(hex_c[i : i + 2], 16) / 255.0 for i in (0, 2, 4)]
-                                except ValueError:
-                                    rgb_c = [0.0, 0.0, 0.0]
-                            else:
-                                rgb_c = [0.0, 0.0, 0.0]
+                            rgb_c = [v / 255.0 for v in self._parse_hex_rgb_0_255(str(lyr.get("color_hex", "#111111")))]
                             mean_abs = (1.0 - (sum(rgb_c) / 3.0)) if not invert_board else (sum(rgb_c) / 3.0)
                             depth_comp += self.canvas_manager.compute_optical_depth_1d(p, alpha_l) * max(0.05, mean_abs)
                         depth_2d = depth_comp.reshape((self.canvas_manager.size, self.canvas_manager.size))
@@ -324,7 +322,7 @@ class EvolutionCoordinator:
                                 else ((255.0 - tgt_np.astype(np.float32)) / 255.0)
                             )
                             cur_d = np.clip(1.0 - np.exp(-depth_2d * 1.6), 0.0, 1.0)
-                            diff_map = (tgt_d - cur_d).astype(np.float32)
+                            diff_map = (cur_d - tgt_d).astype(np.float32)
                             self._push_analytic_maps(diff_map, depth_2d)
             except Exception:
                 logging.error("Ошибка в потоке рендеринга", exc_info=True)
@@ -387,6 +385,27 @@ class EvolutionCoordinator:
         else:
             ch_budgets = list(phys_budgets)
         return phys_budgets, ch_budgets
+
+    def _compute_layer_budgets(
+        self,
+        channels: List[Dict[str, Any]],
+        mask: np.ndarray,
+        cm: CanvasManager,
+        max_lines: int,
+        line_weight: int,
+        is_adaptive: bool,
+    ) -> List[int]:
+        if is_adaptive and len(channels) > 1:
+            _, layer_budgets = self._compute_adaptive_budgets(
+                [ch["darkness"] for ch in channels], mask, cm, max_lines, line_weight
+            )
+            return layer_budgets
+        if len(channels) > 1:
+            return [
+                estimate_channel_line_budget(ch["darkness"], mask, cm, max_lines, line_weight)
+                for ch in channels
+            ]
+        return [max_lines]
 
     @staticmethod
     def _compute_total_activity(rgb_norm: np.ndarray, invert_board: bool) -> np.ndarray:
@@ -496,22 +515,14 @@ class EvolutionCoordinator:
             self.state.preprocessed_rgb_np = bundle["rgb"]
 
             cm = self._ensure_canvas_manager(config)
+            self.active_fitness_calc = None
             channels = self._build_channels_for_existing_layers(bundle, config)
             is_adaptive = "Адаптивный" in str(config.get("color_mode", ""))
             max_lines = int(config["lines"])
             line_weight = int(config.get("line_weight", 72))
-
-            if is_adaptive and len(channels) > 1:
-                _, layer_budgets = self._compute_adaptive_budgets(
-                    [ch["darkness"] for ch in channels], bundle["mask"], cm, max_lines, line_weight
-                )
-            elif len(channels) > 1:
-                layer_budgets = [
-                    estimate_channel_line_budget(ch["darkness"], bundle["mask"], cm, max_lines, line_weight)
-                    for ch in channels
-                ]
-            else:
-                layer_budgets = [max_lines]
+            layer_budgets = self._compute_layer_budgets(
+                channels, bundle["mask"], cm, max_lines, line_weight, is_adaptive
+            )
 
             radon_enabled = bool(config.get("radon_enabled", True))
             is_multi = len(self.state.layers) > 1 and len(channels) == len(self.state.layers)
@@ -689,6 +700,8 @@ class EvolutionCoordinator:
         self.omp_stop_flag = False
         self.omp_pause_event.set()
         self.state.reset_for_new_run(reset_layers=True)
+        self.active_fitness_calc = None
+        self.radon_guide = None
         self.ui_manager.toggle_ui_state(True)
         self.best_chromosomes_by_key.clear()
         self.ui_manager.setup_for_new_run(config["num_islands"])
@@ -722,6 +735,7 @@ class EvolutionCoordinator:
 
             radon_guide = None
             self.radon_guide = None
+            self.active_fitness_calc = None
             if radon_enabled:
                 self._send_status(tr("st_radon", lang), run_id=run_id)
                 primary_density = None if is_cmyk else channels[0]["darkness"]
@@ -1059,22 +1073,7 @@ class EvolutionCoordinator:
         return self.omp_stop_flag
 
     def _rgb_to_lab(self, arr: np.ndarray) -> np.ndarray:
-        mask_s = arr > 0.04045
-        lin = np.where(mask_s, ((arr + 0.055) / 1.055) ** 2.4, arr / 12.92)
-        m = np.array([[0.4124564, 0.3575761, 0.1804375],
-                      [0.2126729, 0.7151522, 0.0721750],
-                      [0.0193339, 0.1191920, 0.9503041]], dtype=np.float32)
-        shape = lin.shape
-        flat = lin.reshape(-1, 3) @ m.T
-        flat /= np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
-        eps = 0.008856
-        kappa = 903.3
-        fx = np.where(flat > eps, flat ** (1.0 / 3.0), (kappa * flat + 16.0) / 116.0)
-        L = 116.0 * fx[:, 1] - 16.0
-        a = 500.0 * (fx[:, 0] - fx[:, 1])
-        b = 200.0 * (fx[:, 1] - fx[:, 2])
-        lab = np.stack([L, a, b], axis=-1)
-        return lab.reshape(shape[:-1] + (3,))
+        return rgb_to_lab_array(arr)
 
     @staticmethod
     def _ciede2000_vec(lab1: np.ndarray, lab2_arr: np.ndarray) -> np.ndarray:
@@ -1797,17 +1796,9 @@ class EvolutionCoordinator:
             is_adaptive = "Адаптивный" in str(config.get("color_mode", ""))
             max_lines = int(config["lines"])
             line_weight = int(config.get("line_weight", 72))
-            if is_adaptive and len(channels) > 1:
-                _, layer_budgets = self._compute_adaptive_budgets(
-                    [ch["darkness"] for ch in channels], bundle["mask"], cm, max_lines, line_weight
-                )
-            elif len(channels) > 1:
-                layer_budgets = [
-                    estimate_channel_line_budget(ch["darkness"], bundle["mask"], cm, max_lines, line_weight)
-                    for ch in channels
-                ]
-            else:
-                layer_budgets = [max_lines]
+            layer_budgets = self._compute_layer_budgets(
+                channels, bundle["mask"], cm, max_lines, line_weight, is_adaptive
+            )
 
             for l_idx, layer in enumerate(self.state.layers):
                 path = layer.get("path", [])
@@ -1978,15 +1969,28 @@ class EvolutionCoordinator:
                 except (tk.TclError, ValueError):
                     pass
 
-        self.state.layers = [
-            {
+        num_pins = max(2, int(self.state.safe_get("pins") or 260))
+        cleaned_layers: List[Dict[str, Any]] = []
+        for i, l in enumerate(proj["layers"]):
+            raw_path = [int(p) for p in l.get("path", [])]
+            valid_path = [p for p in raw_path if 0 <= p < num_pins]
+            if len(valid_path) != len(raw_path):
+                logging.warning(
+                    "Слой #%d (%s): отброшено %d невалидных индексов гвоздей вне [0, %d).",
+                    i + 1,
+                    l.get("name", "?"),
+                    len(raw_path) - len(valid_path),
+                    num_pins,
+                )
+            item: Dict[str, Any] = {
                 "name": str(l.get("name", f"Слой {i + 1}")),
                 "color_hex": str(l.get("color_hex", "#111111")),
-                "path": [int(p) for p in l.get("path", [])],
-                **({"ref_lines": int(l["ref_lines"])} if "ref_lines" in l else {}),
+                "path": valid_path,
             }
-            for i, l in enumerate(proj["layers"])
-        ]
+            if "ref_lines" in l:
+                item["ref_lines"] = int(l["ref_lines"])
+            cleaned_layers.append(item)
+        self.state.layers = cleaned_layers
         raw_ali = int(proj.get("active_layer_idx", 0))
         if raw_ali < 0 and len(self.state.layers) > 1:
             self.state.active_layer_idx = -1
@@ -2003,8 +2007,8 @@ class EvolutionCoordinator:
                     self.state.original_image = raw.copy()
                 self.state.original_image_path = img_path
                 self.root.redraw_target_canvas()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.warning("Не удалось переоткрыть исходное изображение '%s': %s", img_path, exc)
         elif source_path:
             self.state.original_image_path = source_path
 

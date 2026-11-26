@@ -269,6 +269,7 @@ class TestAppIntegration(unittest.TestCase):
                 app.update()
                 time.sleep(0.03)
             self.assertFalse(app.state.is_running, "Адаптивный синтез не завершился вовремя")
+            self.assertIsNone(app.coordinator.active_fitness_calc)
             self.assertGreaterEqual(len(app.state.layers), 2)
             for lyr in app.state.layers:
                 self.assertGreaterEqual(len(lyr.get("path", [])) - 1, 5, "Адаптивный слой не должен состоять из 1 нити")

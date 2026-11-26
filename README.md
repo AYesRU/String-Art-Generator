@@ -72,7 +72,7 @@ pip install -r requirements.txt
 # Run String Art Studio
 python string-art-generator.py
 ```
-*On Windows, you can also double-click `run_studio.bat`.*
+*On Windows, you can also double-click `run_studio.bat`. Note: the prebuilt standalone `.exe` release excludes PyTorch to remain compact (~122 MB, CPU SciPy CSR + NumPy), whereas running from source with `torch` installed enables CUDA GPU acceleration.*
 
 ### 🧪 Running Tests
 ```bash

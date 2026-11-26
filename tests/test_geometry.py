@@ -139,6 +139,24 @@ class TestGeometryAndPreprocessing(unittest.TestCase):
         cm.release_gpu_cache()
         self.assertLess(float(np.max(np.abs(d_gpu - d_cpu))), 1e-3)
 
+    def test_multilayer_dark_board_and_lazy_pin_sub_matrices(self):
+        cm = CanvasManager(size=200, num_pins=90, shape="Круг")
+        layers = [
+            {"name": "Красный", "color_hex": "#ff2020", "path": [0, 30, 60]},
+            {"name": "Синий", "color_hex": "#2060ff", "path": [15, 45, 75]},
+        ]
+        rgb_dark = cm.render_layers_to_numpy(layers, output_size=200, invert_board=True)
+        # Фон углов остается темным (#121418), а в центре присутствуют цветные нити
+        self.assertLessEqual(int(rgb_dark[2, 2, 0]), 24)
+        self.assertGreater(int(np.max(rgb_dark)), 80)
+
+        from string_art_studio.geometry import _LazyPinSubMatrix
+
+        cm.build_line_tables()
+        probe = np.linspace(0.1, 1.0, cm.size * cm.size, dtype=np.float32)
+        lazy_sub = _LazyPinSubMatrix(cm.line_matrix, cm.pin_neighbor_lids[0])
+        np.testing.assert_allclose(lazy_sub.dot(probe), cm.ensure_pin_sub_matrices()[0].dot(probe), atol=1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()

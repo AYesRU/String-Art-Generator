@@ -44,6 +44,19 @@ def compute_min_pin_distance(num_pins: int) -> int:
     return max(8, min(20, max(1, num_pins // 14)))
 
 
+class _LazyPinSubMatrix:
+    """Легковесная обертка подматрицы CSR для высокого числа гвоздей (>600) без дублирования памяти."""
+
+    def __init__(self, matrix: sp.csr_matrix, row_indices: np.ndarray):
+        self._matrix = matrix
+        self._row_indices = row_indices
+
+    def dot(self, vec: np.ndarray) -> np.ndarray:
+        if len(self._row_indices) == 0:
+            return np.empty(0, dtype=np.float32)
+        return self._matrix[self._row_indices].dot(vec)
+
+
 class CanvasManager:
     """
     Менеджер геометрии рамы (6 форм), разреженной матрицы пикселей хорд (CSR),
@@ -85,6 +98,14 @@ class CanvasManager:
         self._gpu_a_t_csr: Optional[Any] = None
         self._gpu_pin_coords: Optional[Any] = None
         self._gpu_render_enabled: bool = _TORCH_CUDA_AVAILABLE
+
+    def mm_per_px(self) -> float:
+        """Единый физический масштаб (мм на пиксель) для метража, ЧПУ G-Code и шаблона 1:1."""
+        return (self.physical_cm * 10.0) / max(1.0, float(self.size))
+
+    def m_per_px(self) -> float:
+        """Единый физический масштаб (метры на пиксель) для расчета длины нити."""
+        return self.mm_per_px() / 1000.0
 
     def _calculate_pin_coords(self) -> np.ndarray:
         coords: List[Tuple[float, float]] = []
@@ -206,7 +227,7 @@ class CanvasManager:
         self.min_pin_distance = min_dist
 
         n_pixels = self.size * self.size
-        m_per_pixel = (self.physical_cm / 100.0) / max(1.0, float(self.size * 0.93))
+        m_per_pixel = self.m_per_px()
 
         self.line_dict.clear()
         self.line_keys.clear()
@@ -311,19 +332,22 @@ class CanvasManager:
         dt = time.perf_counter() - t0
         logging.info(f"Таблица хорд DDA CSR построена: {n_chords} хорд за {dt:.3f} сек.")
 
-    def ensure_pin_sub_matrices(self) -> List[sp.csr_matrix]:
+    def ensure_pin_sub_matrices(self) -> List[Any]:
         """
-        Преднарезает подматрицы CSR для каждого гвоздя один раз, устраняя копирование
-        подматриц внутри цикла OMP (дает 3-5x ускорение до 10,000-18,000 лин/с).
+        Преднарезает подматрицы CSR для каждого гвоздя один раз (при num_pins <= 600),
+        а при > 600 гвоздей использует ленивую нарезку без дублирования гигабайтов памяти.
         """
         self.build_line_tables()
         if self.pin_sub_matrices is None and self.line_matrix is not None:
             t0 = time.perf_counter()
             A = self.line_matrix
-            self.pin_sub_matrices = [
-                A[lids] if len(lids) > 0 else sp.csr_matrix((0, self.size * self.size), dtype=np.float32)
-                for lids in self.pin_neighbor_lids
-            ]
+            if self.num_pins <= 600:
+                self.pin_sub_matrices = [
+                    A[lids] if len(lids) > 0 else sp.csr_matrix((0, self.size * self.size), dtype=np.float32)
+                    for lids in self.pin_neighbor_lids
+                ]
+            else:
+                self.pin_sub_matrices = [_LazyPinSubMatrix(A, lids) for lids in self.pin_neighbor_lids]
             logging.info(f"Преднарезка pin_sub_matrices выполнена за {(time.perf_counter() - t0) * 1000:.1f} мс.")
         return self.pin_sub_matrices or []
 
@@ -449,8 +473,7 @@ class CanvasManager:
                 return 0.0
         diffs = self.pin_coords[idx[1:]] - self.pin_coords[idx[:-1]]
         total_px = float(np.sum(np.hypot(diffs[:, 0], diffs[:, 1])))
-        m_per_px = (self.physical_cm / 100.0) / max(1.0, float(self.size * 0.93))
-        return total_px * m_per_px
+        return total_px * self.m_per_px()
 
     def _accumulate_path_depth_gpu(
         self,
@@ -706,15 +729,25 @@ class CanvasManager:
                 else:
                     r_c, g_c, b_c = 0.0, 0.0, 0.0
 
-                # Нить поглощает свет своего дополнительного цвета:
-                # Белый фон (1,1,1) минус отражение нити (r_c, g_c, b_c)
-                d_r += d_layer * (1.0 - r_c)
-                d_g += d_layer * (1.0 - g_c)
-                d_b += d_layer * (1.0 - b_c)
+                # Светлая доска: нить поглощает дополнительный цвет (1 - r_c).
+                # Темная доска (invert_board=True): нить отражает свой собственный цвет (r_c, g_c, b_c).
+                if invert_board:
+                    d_r += d_layer * r_c
+                    d_g += d_layer * g_c
+                    d_b += d_layer * b_c
+                else:
+                    d_r += d_layer * (1.0 - r_c)
+                    d_g += d_layer * (1.0 - g_c)
+                    d_b += d_layer * (1.0 - b_c)
 
-            r_u8 = np.clip(np.exp(-d_r * 1.6) * 255.0, 0.0, 255.0).astype(np.uint8)
-            g_u8 = np.clip(np.exp(-d_g * 1.6) * 255.0, 0.0, 255.0).astype(np.uint8)
-            b_u8 = np.clip(np.exp(-d_b * 1.6) * 255.0, 0.0, 255.0).astype(np.uint8)
+            if invert_board:
+                r_u8 = np.clip(18.0 + (1.0 - np.exp(-d_r * 1.6)) * 237.0, 0.0, 255.0).astype(np.uint8)
+                g_u8 = np.clip(18.0 + (1.0 - np.exp(-d_g * 1.6)) * 237.0, 0.0, 255.0).astype(np.uint8)
+                b_u8 = np.clip(18.0 + (1.0 - np.exp(-d_b * 1.6)) * 237.0, 0.0, 255.0).astype(np.uint8)
+            else:
+                r_u8 = np.clip(np.exp(-d_r * 1.6) * 255.0, 0.0, 255.0).astype(np.uint8)
+                g_u8 = np.clip(np.exp(-d_g * 1.6) * 255.0, 0.0, 255.0).astype(np.uint8)
+                b_u8 = np.clip(np.exp(-d_b * 1.6) * 255.0, 0.0, 255.0).astype(np.uint8)
             result_rgb = cv2.merge([r_u8, g_u8, b_u8])
 
         pin_scale = out_dim / float(self.size)
@@ -736,7 +769,7 @@ class CanvasManager:
                 cv2.circle(result_rgb, p1_scr, max(3, int(round(out_dim / 140))), (220, 38, 38), -1, lineType=cv2.LINE_AA)
                 cv2.circle(result_rgb, p2_scr, max(4, int(round(out_dim / 120))), (0, 220, 180), -1, lineType=cv2.LINE_AA)
 
-        pin_color = (185, 190, 200) if (invert_board and not is_color) else (60, 60, 65)
+        pin_color = (185, 190, 200) if invert_board else (60, 60, 65)
         pin_r = max(1, int(round(out_dim / 340)))
         for px, py in self.pin_coords:
             cx_i = int(round(float(px) * pin_scale))
